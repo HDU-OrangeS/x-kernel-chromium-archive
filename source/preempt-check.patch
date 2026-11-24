@@ -1,0 +1,131 @@
+diff --git a/task/ktask/docs/design.md b/task/ktask/docs/design.md
+index 49e383dd8..206a85160 100644
+--- a/task/ktask/docs/design.md
++++ b/task/ktask/docs/design.md
+@@ -20,6 +20,10 @@ x-kernel 将“**调度算法**”与“**任务运行时**”分离：
+ ## 抢占检查的迭代退出
+ 
+ `current_check_preempt_pending()` 在循环中处理 `need_resched`。
++guard 释放和任务返回入口复用已经取得的当前任务进行首轮检查。只有进入运行队列的
++一轮完成后，才重新取得当前任务继续复查。在 AArch64 上，这省去首轮重复读取当前
++任务时附带的 IRQ 保存和恢复。每轮仍按原条件记录抢占检查统计。
++
+ 运行队列 guard 恢复 IRQ 时可能产生新的调度请求，因此不能让该 guard 的析构
+ 再次递归调用抢占检查。每轮在释放 guard 前临时增加一次禁抢占计数：
+ 计数从 1 变成 2，guard 释放后回到 1，最后通过 `enable_preempt(false)` 回到 0。
+diff --git a/task/ktask/docs/security.md b/task/ktask/docs/security.md
+index e79fe6880..045fb7bb0 100644
+--- a/task/ktask/docs/security.md
++++ b/task/ktask/docs/security.md
+@@ -22,6 +22,10 @@
+ 必须保持计数 1 → 2 → 1 → 0 的配对关系，保留新发布的 `need_resched`，
+ 且仍遵守禁抢占和异常上下文的入口限制。没有新增跨 CPU 重入标志或共享锁。
+ 
++首轮检查复用调用方已取得的当前任务，仅表示执行该调用的任务身份。当前 CPU 和运行
++队列在原 guard 保护下获取。首轮保留 `Acquire` pending 读取和异常上下文检查，进入
++运行队列后仍复查 pending。IRQ mask 恢复与抢占计数更新沿用原顺序。
++
+ ## 信任模型
+ 
+ ```text
+diff --git a/task/ktask/src/api.rs b/task/ktask/src/api.rs
+index e370e417a..4bd553414 100644
+--- a/task/ktask/src/api.rs
++++ b/task/ktask/src/api.rs
+@@ -486,8 +486,8 @@ pub(crate) fn on_remote_resched_ipi() {
+ /// the CPU is no longer inside an active exception context.
+ #[cfg(feature = "preempt")]
+ pub fn check_preempt_pending() {
+-    if current_may_uninit().is_some() {
+-        crate::task::TaskInner::current_check_preempt_pending();
++    if let Some(curr) = current_may_uninit() {
++        curr.current_check_preempt_pending();
+     }
+ }
+ 
+diff --git a/task/ktask/src/task.rs b/task/ktask/src/task.rs
+index ff4c19bf7..148136b05 100644
+--- a/task/ktask/src/task.rs
++++ b/task/ktask/src/task.rs
+@@ -850,43 +850,52 @@ impl TaskInner {
+     #[cfg(feature = "preempt")]
+     pub(crate) fn enable_preempt(&self, resched: bool) {
+         if self.preempt_disable_count.fetch_sub(1, Ordering::Release) == 1 && resched {
+-            // If current task is pending to be preempted, do rescheduling.
+-            Self::current_check_preempt_pending();
++            self.current_check_preempt_pending();
++        }
++    }
++
++    /// Checks pending preemption for the current task already obtained by the caller.
++    ///
++    /// The receiver must denote the task executing this call. A second current
++    /// task lookup is only needed after an iteration that entered the run queue.
++    #[cfg(feature = "preempt")]
++    pub(crate) fn current_check_preempt_pending(&self) {
++        if self.check_preempt_pending_once() {
++            while crate::current().check_preempt_pending_once() {}
+         }
+     }
+ 
+     #[cfg(feature = "preempt")]
+-    pub(crate) fn current_check_preempt_pending() {
++    fn check_preempt_pending_once(&self) -> bool {
+         use kspin::NoPreemptIrqSave;
+-        loop {
+-            let curr = crate::current();
+-            let need_resched = curr.need_resched.load(Ordering::Acquire);
+-            crate::run_queue::record_preempt_pending_check(need_resched);
+-            if !need_resched {
+-                return;
+-            }
+ 
+-            let can_preempt = curr.can_preempt(0);
+-            let in_exception = khal::context::in_exception_context();
+-            crate::run_queue::record_preempt_pending_blocked(can_preempt, in_exception);
+-            if !can_preempt || in_exception {
+-                return;
+-            }
++        let need_resched = self.need_resched.load(Ordering::Acquire);
++        crate::run_queue::record_preempt_pending_check(need_resched);
++        if !need_resched {
++            return false;
++        }
+ 
+-            let mut rq = crate::current_run_queue::<NoPreemptIrqSave>();
+-            if curr.need_resched.load(Ordering::Acquire) && !khal::context::in_exception_context() {
+-                rq.preempt_resched()
+-            }
+-            #[cfg(unittest)]
+-            curr.preempt_check_probe.rearm(&curr);
+-
+-            // IRQ restore can publish a new request before this frame returns.
+-            // Keep the count above zero through guard release (1 -> 2 -> 1),
+-            // then restore it without rescheduling; the loop handles the request.
+-            curr.disable_preempt();
+-            drop(rq);
+-            curr.enable_preempt(false);
++        let can_preempt = self.can_preempt(0);
++        let in_exception = khal::context::in_exception_context();
++        crate::run_queue::record_preempt_pending_blocked(can_preempt, in_exception);
++        if !can_preempt || in_exception {
++            return false;
++        }
++
++        let mut rq = crate::current_run_queue::<NoPreemptIrqSave>();
++        if self.need_resched.load(Ordering::Acquire) && !khal::context::in_exception_context() {
++            rq.preempt_resched();
+         }
++        #[cfg(unittest)]
++        self.preempt_check_probe.rearm(self);
++
++        // IRQ restore can publish a new request before this frame returns.
++        // Keep the count above zero through guard release (1 -> 2 -> 1),
++        // then restore it without rescheduling; the loop handles the request.
++        self.disable_preempt();
++        drop(rq);
++        self.enable_preempt(false);
++        true
+     }
+ 
+     /// Notify all tasks that join on this task.

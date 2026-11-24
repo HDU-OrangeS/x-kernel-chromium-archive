@@ -1,0 +1,2 @@
+# Preserve frozen patch bytes, including the space on blank context records.
+source/*.patch -text -whitespace

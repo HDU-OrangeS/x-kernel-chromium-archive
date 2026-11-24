@@ -1,0 +1,2498 @@
+diff --git a/fs/filesystems/kext4/docs/design.md b/fs/filesystems/kext4/docs/design.md
+index a889badb5..17e9699c7 100644
+--- a/fs/filesystems/kext4/docs/design.md
++++ b/fs/filesystems/kext4/docs/design.md
+@@ -368,6 +368,11 @@ kext4 KVFS 层则继续使用有界的三阶段 eviction。
+ 
+ ## 算法流程
+ 
++普通文件读取先按 EOF 截短请求，再按 extent 解析盘块。同一已初始化 extent 内，文件偏移和
++长度均满足整块条件且目标缓冲满足块设备的 4 字节对齐要求时，直接把目标切片交给块层，省去
++中转缓冲的分配、清零和复制。块内偏移、非整块长度和未对齐的目标缓冲沿用原路径。块请求的
++起始地址和长度仍由同一套 extent 与设备范围校验确定。
++
+ Namei 修改先验证 parent/name，查找目标 dirent，检查 inode kind 和磁盘格式约束，然后在
+ 一个 journal transaction 中完成 dirent 和 inode 更新。Rename 使用准备、替换、删除、收尾
+ 的顺序，保证目录父链接计数和 `..` 更新保持一致。
+diff --git a/fs/filesystems/kext4/docs/security.md b/fs/filesystems/kext4/docs/security.md
+index 7783c0401..7337eca3d 100644
+--- a/fs/filesystems/kext4/docs/security.md
++++ b/fs/filesystems/kext4/docs/security.md
+@@ -242,6 +242,10 @@ Namespace removal 对不支持的 orphan-file 格式必须在首个 metadata mut
+ 
+ ## 故障管理
+ 
++整块读取直接使用内核目标缓冲。块设备返回错误时，缓冲可能已有部分数据。按需读入的新
++folio 只在读取成功后登记到 PageCache，预读也只在成功后发布缓冲内容。块层继续负责 DMA
++映射及完成同步。
++
+ KExt4 使用 `Ext4Result` 和 typed `Ext4Error` 表达 corruption、unsupported format、
+ out-of-bounds metadata、checksum mismatch、journal credit exhaustion 和 device error。
+ 日志化修改路径把普通失败前移到首次 metadata access 前；多个 handle 的空失败不会影响同一
+diff --git a/fs/filesystems/kext4/src/file.rs b/fs/filesystems/kext4/src/file.rs
+index ebf2b0456..7e7b12403 100644
+--- a/fs/filesystems/kext4/src/file.rs
++++ b/fs/filesystems/kext4/src/file.rs
+@@ -270,6 +270,14 @@ impl Ext4SbInfo {
+     }
+ 
+     /// Reads bytes from a regular file inode.
++    ///
++    /// Returns the number of bytes filled, up to the end of the file.
++    ///
++    /// # Errors
++    ///
++    /// Returns an error if the inode kind, block mapping, or backing I/O is
++    /// invalid. An error can leave partially written output; only a successful
++    /// return supplies a valid byte count.
+     pub fn read_at(&self, inode: &Ext4Inode, offset: u64, output: &mut [u8]) -> Ext4Result<usize> {
+         if inode.kind() != InodeKind::RegularFile {
+             return Err(Ext4Error::Unsupported(UnsupportedKind::InodeKind));
+@@ -372,21 +380,29 @@ impl Ext4SbInfo {
+                     let block_count = rounded_bytes
+                         .checked_div(block_size_usize)
+                         .ok_or(Ext4Error::Overflow)?;
+-                    let mut block_bytes = vec![
+-                        0;
+-                        block_count
+-                            .checked_mul(block_size_usize)
+-                            .ok_or(Ext4Error::Overflow)?
+-                    ];
+                     let block_count_u32 =
+                         u32::try_from(block_count).map_err(|_| Ext4Error::Overflow)?;
+-                    self.read_blocks(first_block, block_count_u32, &mut block_bytes)?;
+-                    let source_end = in_block.checked_add(read_len).ok_or(Ext4Error::Overflow)?;
+-                    output[copied..copied + read_len].copy_from_slice(
+-                        block_bytes
+-                            .get(in_block..source_end)
+-                            .ok_or(Ext4Error::OutOfBounds)?,
+-                    );
++                    let destination = &mut output[copied..copied + read_len];
++                    // AHCI and BCM2835 SDHCI require word-aligned block buffers.
++                    if in_block == 0
++                        && read_len.is_multiple_of(block_size_usize)
++                        && destination.as_ptr().addr().is_multiple_of(4)
++                    {
++                        self.read_blocks(first_block, block_count_u32, destination)?;
++                    } else {
++                        let mut block_bytes = vec![
++                            0;
++                            block_count
++                                .checked_mul(block_size_usize)
++                                .ok_or(Ext4Error::Overflow)?
++                        ];
++                        self.read_blocks(first_block, block_count_u32, &mut block_bytes)?;
++                        destination.copy_from_slice(
++                            block_bytes
++                                .get(in_block..covered_bytes)
++                                .ok_or(Ext4Error::OutOfBounds)?,
++                        );
++                    }
+                     copied += read_len;
+                 }
+             }
+diff --git a/fs/filesystems/kext4/src/superblock.rs b/fs/filesystems/kext4/src/superblock.rs
+index 743699b59..aee8ccea6 100644
+--- a/fs/filesystems/kext4/src/superblock.rs
++++ b/fs/filesystems/kext4/src/superblock.rs
+@@ -2097,6 +2097,7 @@ mod tests {
+         bytes: Mutex<Vec<u8>>,
+         flush_count: Mutex<usize>,
+         fail_flush_at: Mutex<Option<usize>>,
++        require_aligned_reads: Mutex<bool>,
+     }
+ 
+     struct LinuxImageDevice {
+@@ -2121,6 +2122,7 @@ mod tests {
+                 bytes: Mutex::new(bytes),
+                 flush_count: Mutex::new(0),
+                 fail_flush_at: Mutex::new(None),
++                require_aligned_reads: Mutex::new(false),
+             }
+         }
+ 
+@@ -2179,6 +2181,11 @@ mod tests {
+         }
+ 
+         fn read_block(&self, block_id: u64, output: &mut [u8]) -> DriverResult {
++            if *self.require_aligned_reads.lock().unwrap()
++                && !output.as_ptr().addr().is_multiple_of(4)
++            {
++                return Err(DriverError::InvalidInput);
++            }
+             let start = block_start(block_id)?;
+             let end = start
+                 .checked_add(output.len())
+@@ -6684,7 +6691,7 @@ mod tests {
+ 
+     #[test]
+     fn ordered_writeback_commits_disk_size_without_changing_visible_size() {
+-        let (mut filesystem, _device) =
++        let (mut filesystem, device) =
+             journal_allocator_test_filesystem(TEST_FREE_BLOCKS, 0b0011_1111);
+         let inode = allocate_checkpointed_regular_inode(&mut filesystem);
+         install_test_internal_journal(&mut filesystem, 701);
+@@ -6724,6 +6731,20 @@ mod tests {
+         );
+         assert_eq!(output, input);
+ 
++        // A whole-block file read still accepts a byte-aligned output slice
++        // when the backing device requires word-aligned buffers.
++        *device.require_aligned_reads.lock().unwrap() = true;
++        let mut output = vec![0xff; TEST_BLOCK_SIZE + 5];
++        let start = output.as_ptr().align_offset(4) + 1;
++        let end = start + TEST_BLOCK_SIZE;
++        assert_eq!(
++            filesystem.read_at(&inode, 0, &mut output[start..end]),
++            Ok(TEST_BLOCK_SIZE)
++        );
++        assert_eq!(&output[start..end], input.as_slice());
++        assert_eq!(output[start - 1], 0xff);
++        assert_eq!(output[end], 0xff);
++
+         filesystem
+             .commit_regular_inode_write_metadata(
+                 &inode,
+diff --git a/fs/filesystems/procfs/docs/design.md b/fs/filesystems/procfs/docs/design.md
+index bce6a30f7..0f6c4c820 100644
+--- a/fs/filesystems/procfs/docs/design.md
++++ b/fs/filesystems/procfs/docs/design.md
+@@ -90,14 +90,27 @@ USER_HZ=100 的 tick，不是 QEMU 宿主进程时间。
+ `stat` 的 vsize 为虚拟地址字节数，rss 为驻留基页数；`status` 的 VmSize、VmRSS
+ 使用 kB（1024 字节）。内存由目标进程的 `MmSpace::resident_memory_snapshot`
+ 提供。`status` 同时给出 PPid、Threads，PID/TID 身份遵循各目录范围。
+-目前没有可靠的共享页比例/峰值跟踪，不添加 PSS、VmHWM，也不伪造 statm 的
+-shared 字段。对多个 Chromium 进程求 RSS 和可能重复计算共享页，应在报告中
+-说明口径；不同进程峰值不能相加冒充同一时刻的进程组峰值。
++对多个 Chromium 进程求 RSS 和可能重复计算共享页。`status` 没有峰值计数，
++`statm` 的 shared 字段未实现。进程组峰值需要用户态在每个采样点求 PSS 和，
++再从同一序列取峰值。
+ 
+ 这些读取获取目标 mm 的睡眠锁，不能从中断调用。mm 已退出或快照失败时直接
+ 返回 provider 错误；进程和线程遍历不是全系统原子快照。进程可在采样间创建、
+ 退出，用户态采样器需要记录覆盖范围与 PID/starttime，不能把读失败算作零。
+ 
++### PSS 快照
++
++`smaps` 和 `smaps_rollup` 在 `SeqFileInode` 的打开回调中采集一次，由 `SmapsIter`
++保存拥有型记录。`smaps` 使用 maps 的地址、权限和映射头，逐 VMA 输出 `Size`、
++`Rss`、`Pss`。`smaps_rollup` 使用 `[rollup]` 头和 `memspace` 提供的总 `Rss`、`Pss`，
++保留 provider 累加后再取整的结果。所有 `kB` 字段均以 1024 字节为单位。
++Dirty、Swap、VmFlags 等未实现字段省略。
++
++打开时先检查用户线程的文件系统 UID，再从原 task 的进程取得 `LiveAddressSpace`。
++读取 `mm_id` 后释放目标 mm mutex，调用 memspace 聚合接口时仍持有目标生命周期
++能力。采集结束即释放能力。此后短读、seek 或 rewind 都从同一份记录输出，重新
++open 才采集下一份。`WouldBlock` 直接返回 `EAGAIN`，重试由观察器控制。
++
+ ## 系统容量与可用内存
+ 
+ `meminfo` 每次迭代从 `kalloc::page_snapshot()` 取得中央 allocator 的 total/free。
+diff --git a/fs/filesystems/procfs/docs/security.md b/fs/filesystems/procfs/docs/security.md
+index d29ae2ad2..fe61fcef4 100644
+--- a/fs/filesystems/procfs/docs/security.md
++++ b/fs/filesystems/procfs/docs/security.md
+@@ -75,6 +75,17 @@ CPU/RSS 的原始数据来自 kprocess 与 memspace，文本层不依据系统 M
+ 也不改变现有 procfs 的访问权限边界。CPU 由调度驻留区间计量，但暂未剥离硬中断
+ 时间；这属于精度边界，不应在性能报告中宣称与 Linux 完全相同的计账分摊。
+ 
++`smaps` 与 `smaps_rollup` 调用可扫描其他地址空间的 PSS provider，仅允许文件系统 UID
++为 0 的用户线程打开。授权在打开回调中检查，普通 `maps`、`stat`、`status` 沿用原有
++访问策略。文件描述符持有一次快照，传递给其他进程后只允许读取这次已授权的结果。
++文本只含目标映射的虚拟地址、现有 maps 元数据和聚合数值。逐 VMA 格式会转义路径
++里的换行和回车，避免路径被读取器解释为独立的 `Pss` 或 `Rss` 字段。
++
++目标 mm 的生命周期能力只保留到采集结束，procfs 进入 provider 前已经释放 mm
++mutex。快照冲突或失败按原错误返回，不循环重试或输出部分数据。特权采样可能拖慢
++被测程序和全系统地址空间操作，应另行记录观测开销。此路径不提供 Linux 的完整
++ptrace/dumpability 权限模型，也不公开物理地址或页内容。
++
+ ## 系统内存节点
+ 
+ MemTotal 与 MemFree 来自中央 allocator 的单次加锁快照，避免并发分配使总量
+diff --git a/fs/filesystems/procfs/src/task_nodes/root.rs b/fs/filesystems/procfs/src/task_nodes/root.rs
+index 613aec5a1..64c89fa91 100644
+--- a/fs/filesystems/procfs/src/task_nodes/root.rs
++++ b/fs/filesystems/procfs/src/task_nodes/root.rs
+@@ -13,13 +13,14 @@ use alloc::{
+ };
+ use core::{
+     ffi::CStr,
++    fmt::Write,
+     iter, str,
+     sync::atomic::{AtomicUsize, Ordering},
+ };
+ 
+ use kaddr_layout::{SIGNAL_TRAMPOLINE, USER_HEAP_BASE, USER_STACK_SIZE, USER_STACK_TOP};
+ use khal::paging::MappingFlags;
+-use kprocess::{AsThread, LiveAddressSpace, Process, TaskStat, procfs};
++use kprocess::{AsThread, LiveAddressSpace, Process, TaskStat, current_cred, procfs};
+ use ktask::{KtaskRef, WeakKtaskRef, current};
+ #[cfg(feature = "tee")]
+ use kvfs::DirMapping;
+@@ -212,6 +213,23 @@ struct MapsEntry {
+     name: Option<&'static str>,
+ }
+ 
++impl MapsEntry {
++    fn from_vma(vma: &memspace::VmArea, heap_top: usize) -> Self {
++        let start = vma.start().as_usize();
++        let end = vma.end().as_usize();
++        let (offset, inode, path) = backend_file_mapping(vma).unwrap_or((0, 0, None));
++        Self {
++            start,
++            end,
++            flags: vma.flags(),
++            offset,
++            inode,
++            path,
++            name: special_mapping_name(start, end, heap_top),
++        }
++    }
++}
++
+ fn backend_file_mapping(vma: &memspace::VmArea) -> Option<(u64, u64, Option<String>)> {
+     let info = vma.file_mapping()?;
+     Some((
+@@ -294,18 +312,10 @@ impl SeqIterator for MapsIter {
+         self.next_index = 0;
+         let aspace = self.aspace.lock();
+         for vma in aspace.vmas() {
+-            let start = vma.start().as_usize();
+-            let end = vma.end().as_usize();
+-            let (offset, inode, path) = backend_file_mapping(vma).unwrap_or((0, 0, None));
+-            self.entries.push(MapsEntry {
+-                start,
+-                end,
+-                flags: vma.flags(),
+-                offset,
+-                inode,
+-                path,
+-                name: special_mapping_name(start, end, self.heap_top.load(Ordering::Relaxed)),
+-            });
++            self.entries.push(MapsEntry::from_vma(
++                vma,
++                self.heap_top.load(Ordering::Relaxed),
++            ));
+         }
+     }
+ 
+@@ -328,6 +338,133 @@ impl SeqIterator for MapsIter {
+     }
+ }
+ 
++#[derive(Clone, Copy)]
++enum SmapsView {
++    PerArea,
++    Rollup,
++}
++
++struct SmapsEntry {
++    mapping: MapsEntry,
++    size_kib: Option<usize>,
++    rss_kib: usize,
++    pss_kib: u64,
++}
++
++impl SmapsEntry {
++    fn for_area(area: memspace::ResidentPssArea, heap_top: usize) -> Self {
++        let mut mapping = MapsEntry::from_vma(&area.vma, heap_top);
++        // A mapped filename must not introduce another stats field.
++        if let Some(path) = &mut mapping.path
++            && path.contains(['\n', '\r'])
++        {
++            *path = path.replace('\n', r"\012").replace('\r', r"\015");
++        }
++        Self {
++            size_kib: Some((mapping.end - mapping.start) / 1024),
++            mapping,
++            rss_kib: area.resident_bytes / 1024,
++            pss_kib: area.pss_kib,
++        }
++    }
++
++    fn rollup(snapshot: &memspace::ResidentPssSnapshot) -> Self {
++        let start = snapshot
++            .areas
++            .first()
++            .map_or(0, |area| area.vma.start().as_usize());
++        let end = snapshot
++            .areas
++            .last()
++            .map_or(0, |area| area.vma.end().as_usize());
++        Self {
++            mapping: MapsEntry {
++                start,
++                end,
++                flags: MappingFlags::empty(),
++                offset: 0,
++                inode: 0,
++                path: None,
++                name: Some("[rollup]"),
++            },
++            size_kib: None,
++            rss_kib: snapshot.resident_bytes / 1024,
++            pss_kib: snapshot.pss_kib,
++        }
++    }
++
++    fn show(&self, buf: &mut String) -> core::fmt::Result {
++        buf.push_str(&render_maps_line(&self.mapping));
++        if let Some(size_kib) = self.size_kib {
++            writeln!(buf, "Size:           {size_kib:>8} kB")?;
++        }
++        writeln!(buf, "Rss:            {:>8} kB", self.rss_kib)?;
++        writeln!(buf, "Pss:            {:>8} kB", self.pss_kib)
++    }
++}
++
++struct SmapsIter {
++    entries: Vec<SmapsEntry>,
++    next_index: usize,
++}
++
++impl SmapsIter {
++    fn new(task_weak: &WeakKtaskRef, view: SmapsView) -> VfsResult<Self> {
++        // The scan can visit other processes' address spaces. Authorize the
++        // current userspace opener before acquiring the target mm capability.
++        if current().try_as_thread().is_none() || current_cred().fsuid() != 0 {
++            return Err(VfsError::PermissionDenied);
++        }
++        let task = upgrade_task(task_weak)?;
++        let process = task.as_thread().process();
++        let aspace = process.address_space()?;
++        let heap_top = process.heap_top()?;
++        // Leave the target lock before the scan. Keep its lifetime capability
++        // until the provider has finished collecting the owned snapshot.
++        let mm_id = aspace.lock().mm_id();
++        let snapshot = memspace::resident_pss_snapshot(mm_id)?;
++        drop(aspace);
++        let entries = match view {
++            SmapsView::PerArea => snapshot
++                .areas
++                .into_iter()
++                .map(|area| SmapsEntry::for_area(area, heap_top))
++                .collect(),
++            SmapsView::Rollup => vec![SmapsEntry::rollup(&snapshot)],
++        };
++        Ok(Self {
++            entries,
++            next_index: 0,
++        })
++    }
++}
++
++impl SeqIterator for SmapsIter {
++    type Item = usize;
++
++    fn rewind(&mut self) {
++        self.next_index = 0;
++    }
++
++    fn start(&mut self) -> Option<Self::Item> {
++        self.rewind();
++        self.next()
++    }
++
++    fn next(&mut self) -> Option<Self::Item> {
++        let index = self.next_index;
++        if index == self.entries.len() {
++            return None;
++        }
++        self.next_index += 1;
++        Some(index)
++    }
++
++    fn show(&self, item: &Self::Item, buf: &mut String) -> core::fmt::Result {
++        self.entries[*item].show(buf)
++    }
++}
++
+ struct ProcFdLink {
+     node: SimpleFsNode,
+     task: WeakKtaskRef,
+@@ -641,6 +778,8 @@ impl SimpleDirOps for ThreadDir {
+                 "oom_score_adj",
+                 "task",
+                 "maps",
++                "smaps",
++                "smaps_rollup",
+                 "mounts",
+                 "mountinfo",
+                 "mountstats",
+@@ -735,6 +874,17 @@ impl SimpleDirOps for ThreadDir {
+                     }
+                 }),
+             ),
++            "smaps" | "smaps_rollup" => {
++                let view = if name == "smaps" {
++                    SmapsView::PerArea
++                } else {
++                    SmapsView::Rollup
++                };
++                lookup.file(
++                    name,
++                    SeqFileInode::new_regular(fs, move || SmapsIter::new(&task_weak, view)),
++                )
++            }
+             "mounts" => lookup.file(
+                 name,
+                 SeqFileInode::new_regular(fs.clone(), {
+@@ -950,11 +1100,13 @@ impl SimpleDirOps for ProcFsHandler {
+ 
+ #[cfg(unittest)]
+ mod tests {
++    use alloc::string::String;
++
+     use khal::paging::MappingFlags;
+     use unittest::{assert_eq, def_test};
+ 
+     use super::{
+-        MapsEntry, PROC_MAPS_ADDR_WIDTH, PROC_MAPS_PATH_COLUMN, format_oom_score_adj,
++        MapsEntry, PROC_MAPS_ADDR_WIDTH, PROC_MAPS_PATH_COLUMN, SmapsEntry, format_oom_score_adj,
+         format_task_status, maps_permissions, namespace_inode, namespace_link_target,
+         parse_oom_score_adj_input, render_maps_line, special_mapping_name,
+     };
+@@ -1048,4 +1200,32 @@ mod tests {
+         assert_eq!(&line[..PROC_MAPS_ADDR_WIDTH], "000040000000");
+         assert_eq!(line.chars().nth(PROC_MAPS_PATH_COLUMN), Some('/'));
+     }
++
++    #[def_test]
++    fn smaps_record_separates_resident_and_proportional_kib() {
++        let mut text = String::new();
++        SmapsEntry {
++            mapping: MapsEntry {
++                start: 0x4000_0000,
++                end: 0x4000_4000,
++                flags: MappingFlags::READ,
++                offset: 0,
++                inode: 0,
++                path: None,
++                name: None,
++            },
++            size_kib: Some(16),
++            rss_kib: 12,
++            pss_kib: 5,
++        }
++        .show(&mut text)
++        .unwrap();
++        assert_eq!(
++            text,
++            "000040000000-000040004000 r--p 00000000 00:00 0\n\
++             Size:                 16 kB\n\
++             Rss:                  12 kB\n\
++             Pss:                   5 kB\n"
++        );
++    }
+ }
+diff --git a/mm/anon/docs/design.md b/mm/anon/docs/design.md
+index 88735dec2..4612ffa9d 100644
+--- a/mm/anon/docs/design.md
++++ b/mm/anon/docs/design.md
+@@ -115,3 +115,10 @@ The query holds the slot-map mutex and reads immutable page sizes directly,
+ avoiding a reference-count lock acquisition for every visited slot. It still
+ walks the materialized slots in the interval; this is not cached or constant-time
+ RSS accounting.
++
++`visit_resident_spans_in_range` shares the same slot walk. It supplies the
++clipped object offset, corresponding physical address, and byte length to a
++kernel caller, including when the requested start lies inside a huge slot.
++The byte-count query waits for the slot-map lock and needs only slot sizes.
++The span query tries the lock once and returns `WouldBlock` on contention
++so a multi-MM caller can release its guards and retry.
+diff --git a/mm/anon/docs/security.md b/mm/anon/docs/security.md
+index d11152be2..586673d26 100644
+--- a/mm/anon/docs/security.md
++++ b/mm/anon/docs/security.md
+@@ -59,9 +59,10 @@ explicit object-slot reference count controls the final release descriptor.
+ Reading a physical address from a retained metadata handle does not authorize
+ access to a frame after its last slot reference has been released.
+ 
+-Resident slot queries take only the slot-map mutex and read immutable sizes.
+-They do not allocate frames, change refcounts or expose physical addresses.
+-Input interval overflow returns InvalidInput. Slot intervals must remain
+-non-overlapping, as required by the runtime's page-size alignment. Callers are
+-responsible for selecting the actual VMA's object interval and must not present
+-the count as PSS.
++Resident slot queries take only the slot-map mutex and read immutable metadata.
++They do not allocate frames or change refcounts. Input interval overflow
++returns `InvalidInput`. Slot intervals must remain non-overlapping as required
++by the runtime's page-size alignment. The span visitor tries the slot-map mutex
++without waiting and supplies physical addresses only to kernel callers. The callback
++must not reenter the object or treat those addresses as frame pins. User-facing
++accounting should export only aggregate statistics.
+diff --git a/mm/anon/src/private.rs b/mm/anon/src/private.rs
+index aca5f8642..3c78d5dd3 100644
+--- a/mm/anon/src/private.rs
++++ b/mm/anon/src/private.rs
+@@ -443,19 +443,73 @@ impl AnonPrivateObject {
+         if object_start == object_end {
+             return Ok(0);
+         }
+-        let pages = self.pages.lock();
++        let mut bytes = 0usize;
++        Self::walk_resident_slots(
++            &self.pages.lock(),
++            object_start,
++            object_end,
++            |_, _, overlap, _| {
++                bytes += overlap;
++            },
++        );
++        Ok(bytes)
++    }
++
++    /// Visits the resident slots intersecting an object interval.
++    ///
++    /// The callback receives each clipped span's object offset, matching
++    /// CPU physical address, and byte length. The query tries the slot-map mutex
++    /// once in sleepable context. The callback must not reenter the object or
++    /// retain the addresses as frame pins. No mapping is faulted in or changed.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`KError::InvalidInput`] if the requested interval overflows
++    /// and [`KError::WouldBlock`] if the slot map is locked.
++    pub fn visit_resident_spans_in_range(
++        &self,
++        object_start: u64,
++        object_len: usize,
++        mut visit: impl FnMut(u64, PhysAddr, usize),
++    ) -> KResult<()> {
++        let object_end = object_start
++            .checked_add(object_len as u64)
++            .ok_or(KError::InvalidInput)?;
++        if object_start == object_end {
++            return Ok(());
++        }
++        let pages = self.pages.try_lock().ok_or(KError::WouldBlock)?;
++        Self::walk_resident_slots(
++            &pages,
++            object_start,
++            object_end,
++            |start, page_offset, bytes, page| {
++                if bytes != 0 {
++                    visit(start, page.phys_addr() + page_offset, bytes);
++                }
++            },
++        );
++        Ok(())
++    }
++
++    fn walk_resident_slots(
++        pages: &BTreeMap<u64, AnonPrivatePageHandle>,
++        object_start: u64,
++        object_end: u64,
++        mut visit: impl FnMut(u64, usize, usize, &AnonPrivatePageHandle),
++    ) {
+         // Slots can be huge pages, so include the predecessor when the query
+         // begins within an already materialized slot.
+         let first = pages
+             .range(..=object_start)
+             .next_back()
+             .map_or(object_start, |(start, _)| *start);
+-        let mut bytes = 0usize;
+         for (&start, page) in pages.range(first..object_end) {
+             let end = start.saturating_add(page.page_size() as u64);
+-            bytes += end.min(object_end).saturating_sub(start.max(object_start)) as usize;
++            let clipped_start = start.max(object_start);
++            let bytes = end.min(object_end).saturating_sub(clipped_start) as usize;
++            visit(clipped_start, (clipped_start - start) as usize, bytes, page);
+         }
+-        Ok(bytes)
+     }
+ 
+     /// Prepares a first-touch private page publication.
+@@ -641,7 +695,7 @@ mod tests {
+         use khal::{mem::PhysAddr, paging::PageSize};
+         let object = AnonPrivateObject::new_root();
+         object
+-            .install_page(0x200000, PhysAddr::from_usize(0x200000), PageSize::Size2M)
++            .install_page(0x200000, PhysAddr::from_usize(0xa00000), PageSize::Size2M)
+             .unwrap();
+         object
+             .install_page(1u64 << 40, PhysAddr::from_usize(0x400000), PageSize::Size4K)
+@@ -654,6 +708,23 @@ mod tests {
+             object.resident_bytes_in_range(0x201000, 0x1000).unwrap(),
+             0x1000
+         );
++        let mut span = None;
++        object
++            .visit_resident_spans_in_range(0x201000, 0x1000, |offset, pa, bytes| {
++                assert!(span.replace((offset, pa, bytes)).is_none());
++            })
++            .unwrap();
++        assert_eq!(
++            span,
++            Some((0x201000, PhysAddr::from_usize(0xa01000), 0x1000))
++        );
++        {
++            let _slot_guard = object.pages.lock();
++            let result = object.visit_resident_spans_in_range(0x201000, 0x1000, |_, _, _| {
++                panic!("a contended span walk must return before visiting a slot")
++            });
++            assert_eq!(result, Err(kerrno::KError::WouldBlock));
++        }
+         assert_eq!(
+             object
+                 .resident_bytes_in_range(0x400000, 1usize << 30)
+diff --git a/mm/filemap/docs/design.md b/mm/filemap/docs/design.md
+index 3f7a9d374..a9929be67 100644
+--- a/mm/filemap/docs/design.md
++++ b/mm/filemap/docs/design.md
+@@ -294,9 +294,19 @@ The backing class alone is not a reliable Linux RssFile classification.
+ Shared mappings count only their own pinned folios
+ within the VMA's current page-offset range, not every cached folio of the inode.
+ PROT_NONE retains these owners and therefore does not lower resident usage.
+-Split ranges partition the count; fork starts with empty shared pins and incurs
++Split ranges partition the count. Fork starts with empty shared pins and incurs
+ residency only on its own faults. Relocation transfers the view ownership already
+-used for page lifetime. No PSS, RssAnon/RssFile split or peak counter is fabricated.
++used for page lifetime.
++
++The resident-span hook enumerates the same VMA interval for proportional
++accounting. Each file pin records the CPU physical address of its folio at
++publication and retains the folio's owner. A folio's address stays fixed from
++allocation until drop. The shared runtime walks only the pins covered by its
++current file-page indices. The private runtime walks its clipped anonymous
++slots and borrowed folio pins using the same object-offset interval. Relocation
++translates that interval to the new virtual base. The hook tries each owner lock
++once and returns `WouldBlock` on contention. The caller discards any spans from
++the incomplete walk. The hook keeps physical identities within the kernel.
+ 
+ ## Clean private-file page borrowing
+ 
+diff --git a/mm/filemap/docs/security.md b/mm/filemap/docs/security.md
+index 66eac5103..456660f98 100644
+--- a/mm/filemap/docs/security.md
++++ b/mm/filemap/docs/security.md
+@@ -124,10 +124,14 @@ completed page-table flush. Relocated runtimes use independent pin tables so an
+ error rollback cannot free a frame still mapped at the source.
+ 
+ Resident-memory observation runs with the target MmSpace mutex and briefly the
+-shared runtime's pin mutex, or the private anon object's slot locks. It neither
+-locks folio contents nor enters filesystem I/O. A count must use current VMA
+-metadata after split/trim/extension; counting the full runtime extent would
+-double-count split mappings. Cached pages owned only by another process are not
++runtime's pin mutex or the private anon object's slot lock. The span query
++does not wait for either owner mutex and may return `WouldBlock` after reporting
++earlier spans. The caller must discard the partial result. The span callback
++cannot reenter MM or owner locks. Capturing the immutable physical address when
++the runtime publishes each folio pin lets observation avoid folio-content locks
++and filesystem I/O. Each observation uses the current VMA metadata after a split,
++trim or extension so that the same user's mapping contributes once. Cached
++pages owned only by another process are not
+ charged to this shared view. The per-view regression covers two mms, PROT_NONE,
+ fork/refault, partial unmap and final cleanup.
+ 
+diff --git a/mm/filemap/src/private.rs b/mm/filemap/src/private.rs
+index 854d88353..fb667d16b 100644
+--- a/mm/filemap/src/private.rs
++++ b/mm/filemap/src/private.rs
+@@ -3,7 +3,7 @@
+ // See LICENSES for license details.
+ 
+ use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+-use core::slice;
++use core::{ops::Range, slice};
+ 
+ use anon::{AnonPrivateObject, AnonPrivatePageCommitError, AnonPrivateViewGuard};
+ use kerrno::{KError, KResult};
+@@ -15,8 +15,8 @@ use ksync::Mutex;
+ use kvfs::{AddressSpaceViewGuard, VfsFile};
+ use memaddr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
+ use memspace::{
+-    FaultContext, ForkCloneTarget, InvalidateHandle, MmObserver, MmSpace, VmArea, VmBackingInfo,
+-    VmBackingKind, VmRuntimeOps, VmRuntimeRef,
++    FaultContext, ForkCloneTarget, InvalidateHandle, MmObserver, MmSpace, ResidentSpanSource,
++    VmArea, VmBackingInfo, VmBackingKind, VmRuntimeOps, VmRuntimeRef,
+     backend::{
+         FaultCompletion, FaultCompletionResult, alloc_frame, dealloc_frame,
+         private::{
+@@ -31,9 +31,9 @@ use page_table::PteReplaceError;
+ use pagecache::Folio;
+ use vmobj::{MappingViewId, MappingViewKind, MappingViewSpec};
+ 
+-use crate::runtime::FileRuntimeContext;
++use crate::runtime::{FileRuntimeContext, FolioPin};
+ 
+-type PinnedPrivateFolios = BTreeMap<u64, Arc<Mutex<Folio>>>;
++type PinnedPrivateFolios = BTreeMap<u64, FolioPin>;
+ 
+ #[derive(Clone)]
+ pub(crate) struct FilePrivateRuntime {
+@@ -65,27 +65,33 @@ impl FilePrivateRuntime {
+         self.file_end.unwrap_or_else(|| self.file.size())
+     }
+ 
+-    fn pins_in_range(&self, range: VirtAddrRange) -> KResult<PinnedPrivateFolios> {
++    fn object_offsets_for(&self, range: VirtAddrRange) -> KResult<Range<u64>> {
+         let first = self.object_offset_for(range.start)?;
+         let end = first
+             .checked_add(range.size() as u64)
+             .ok_or(KError::BadAddress)?;
++        Ok(first..end)
++    }
++
++    fn pins_in_range(&self, range: VirtAddrRange) -> KResult<PinnedPrivateFolios> {
++        let offsets = self.object_offsets_for(range)?;
+         Ok(self
+             .pins
+             .lock()
+-            .range(first..end)
+-            .map(|(offset, owner)| (*offset, owner.clone()))
++            .range(offsets)
++            .map(|(offset, pin)| (*offset, pin.clone()))
+             .collect())
+     }
+ 
+     /// Caller has removed the affected PTEs and completed their TLB flush.
+     fn drop_cache_pins(&self, range: VirtAddrRange) -> KResult {
+-        let first = self.object_offset_for(range.start)?;
+-        let end = first
+-            .checked_add(range.size() as u64)
+-            .ok_or(KError::BadAddress)?;
++        let offsets = self.object_offsets_for(range)?;
+         let mut pins = self.pins.lock();
+-        while let Some(offset) = pins.range(first..end).next().map(|(offset, _)| *offset) {
++        while let Some(offset) = pins
++            .range(offsets.clone())
++            .next()
++            .map(|(offset, _)| *offset)
++        {
+             pins.remove(&offset);
+         }
+         Ok(())
+@@ -108,7 +114,7 @@ impl FilePrivateRuntime {
+                 flags - MappingFlags::WRITE,
+             )
+             .map_err(memspace::backend::map_paging_err)?;
+-        self.pins.lock().insert(offset, owner.clone());
++        self.pins.lock().insert(offset, FolioPin::new(owner, folio));
+         if flags.contains(MappingFlags::EXECUTE) {
+             karch::flush_icache_range(p2v(folio.paddr()), PAGE_SIZE_4K);
+         }
+@@ -147,7 +153,7 @@ impl FilePrivateRuntime {
+         &self,
+         addr: VirtAddr,
+         flags: MappingFlags,
+-        owner: Arc<Mutex<Folio>>,
++        pin: FolioPin,
+         pgtbl: &mut PageTableMut,
+     ) -> FaultCompletionResult {
+         let offset = self.object_offset_for(addr)?;
+@@ -157,7 +163,7 @@ impl FilePrivateRuntime {
+             Err(PagingError::NotMapped) => None,
+             Err(err) => return Err(memspace::backend::map_paging_err(err)),
+         };
+-        let folio = owner.lock();
++        let folio = pin.owner().lock();
+         if expected.is_some_and(|entry| {
+             entry.paddr() != folio.paddr() || entry.page_size() != PageSize::Size4K
+         }) {
+@@ -315,9 +321,9 @@ impl FilePrivateRuntime {
+         {
+             let object_start = self.object_offset_for(addr)?;
+             let pinned = self.pins.lock().get(&object_start).cloned();
+-            if let Some(owner) = pinned {
++            if let Some(pin) = pinned {
+                 self.prepare_new_file_backed_page(ctx, addr)?;
+-                return self.cow_cache_page(addr, flags, owner, pgtbl);
++                return self.cow_cache_page(addr, flags, pin, pgtbl);
+             }
+             if cow_private_object_page(&self.anon, object_start, addr, flags, self.size, pgtbl)?
+                 .is_retry()
+@@ -358,12 +364,13 @@ impl FilePrivateRuntime {
+         }
+         if !existing.is_resolved() {
+             let pinned = self.pins.lock().get(&object_start).cloned();
+-            if let Some(owner) = pinned {
++            if let Some(pin) = pinned {
+                 if ctx.access_flags().contains(MappingFlags::WRITE) {
+-                    return self.cow_cache_page(addr, flags, owner, pgtbl);
++                    return self.cow_cache_page(addr, flags, pin, pgtbl);
+                 }
++                let owner = pin.owner();
+                 let folio = owner.lock();
+-                self.map_cache_frame(addr, flags, &owner, &folio, pgtbl)?;
++                self.map_cache_frame(addr, flags, owner, &folio, pgtbl)?;
+             } else if !self.try_borrow_file_page(ctx, addr, flags, pgtbl)? {
+                 let (file_page_offset, page_data_offset) = file_source;
+                 self.alloc_new_at(addr, file_page_offset, page_data_offset, flags, pgtbl)?;
+@@ -549,15 +556,38 @@ impl FilePrivateRuntime {
+ 
+ impl VmRuntimeOps for FilePrivateRuntime {
+     fn resident_bytes(&self, vma: &VmArea) -> KResult<Option<usize>> {
+-        let offset = self.object_offset_for(vma.start())?;
+-        let end = offset
+-            .checked_add(vma.size() as u64)
+-            .ok_or(KError::BadAddress)?;
+-        let anon = self.anon.resident_bytes_in_range(offset, vma.size())?;
+-        let cached = self.pins.lock().range(offset..end).count() * PAGE_SIZE_4K;
++        let offsets = self.object_offsets_for(vma.range())?;
++        let anon = self
++            .anon
++            .resident_bytes_in_range(offsets.start, vma.size())?;
++        let cached = self.pins.lock().range(offsets).count() * PAGE_SIZE_4K;
+         anon.checked_add(cached).map(Some).ok_or(KError::BadAddress)
+     }
+ 
++    fn visit_resident_spans(
++        &self,
++        vma: &VmArea,
++        visit: &mut dyn FnMut(VirtAddr, PhysAddr, usize),
++    ) -> KResult<ResidentSpanSource> {
++        let offsets = self.object_offsets_for(vma.range())?;
++        let start = offsets.start;
++        self.anon
++            .visit_resident_spans_in_range(start, vma.size(), |offset, paddr, len| {
++                visit(vma.start() + (offset - start) as usize, paddr, len);
++            })?;
++        // Borrowed and anonymous slots are disjoint once a fault publishes the
++        // result under the MmSpace lock. Neither phase needs the folio lock.
++        let pins = self.pins.try_lock().ok_or(KError::WouldBlock)?;
++        for (&offset, pin) in pins.range(offsets) {
++            visit(
++                vma.start() + (offset - start) as usize,
++                pin.paddr(),
++                PAGE_SIZE_4K,
++            );
++        }
++        Ok(ResidentSpanSource::Owned)
++    }
++
+     fn backing_info(&self) -> VmBackingInfo {
+         self.backing_info_impl()
+     }
+@@ -687,11 +717,11 @@ impl VmRuntimeOps for FilePrivateRuntime {
+         let pins = self.pins_in_range(range)?;
+         let mut mapped = Vec::new();
+         let clone_result = (|| {
+-            for (offset, owner) in &pins {
++            for (offset, pin) in &pins {
+                 let addr = range.start + (*offset - object_start) as usize;
+                 match old_pgtbl.query(addr) {
+                     Ok((pa, _, size)) => {
+-                        if size != PageSize::Size4K || owner.lock().paddr() != pa {
++                        if size != PageSize::Size4K || pin.paddr() != pa {
+                             return Err(KError::BadAddress);
+                         }
+                         new_pgtbl
+@@ -972,8 +1002,10 @@ mod tests {
+         let mut first_pt = PageTable::try_new().unwrap();
+         let mut second_pt = PageTable::try_new().unwrap();
+         cache_read_fault(&first, &mut first_pt, 0);
++        cache_read_fault(&first, &mut first_pt, 1);
+         cache_read_fault(&second, &mut second_pt, 0);
+         let shared = first_pt.query(first.start).unwrap().0;
++        let sibling = first_pt.query(first.start + PAGE_SIZE_4K).unwrap().0;
+         assert_eq!(shared, second_pt.query(second.start).unwrap().0);
+         assert!(
+             !first_pt
+@@ -1002,8 +1034,24 @@ mod tests {
+             .unwrap();
+         let private = first_pt.query(first.start).unwrap().0;
+         assert_ne!(private, shared);
+-        assert!(first.pins.lock().is_empty());
++        assert!(!first.pins.lock().contains_key(&0));
+         assert_eq!(first.anon.page_at(0).unwrap().phys_addr(), private);
++        let vma = VmArea::new(
++            first.start,
++            first.len,
++            flags,
++            flags,
++            first.backing_info(),
++            0,
++            None,
++        );
++        let mut spans = alloc::vec::Vec::new();
++        first
++            .visit_resident_spans(&vma, &mut |va, pa, bytes| spans.push((va, pa, bytes)))
++            .unwrap();
++        assert_eq!(spans.len(), 2);
++        assert!(spans.contains(&(first.start, private, PAGE_SIZE_4K)));
++        assert!(spans.contains(&(first.start + PAGE_SIZE_4K, sibling, PAGE_SIZE_4K)));
+         // SAFETY: the first runtime exclusively owns this freshly COWed 4K
+         // anonymous frame. The unit test has no concurrently executing user mm.
+         unsafe {
+@@ -1013,7 +1061,9 @@ mod tests {
+         file.mapping().with_folio(0, |folio| {
+             assert_eq!(folio.unwrap().data()[0], 0x6b);
+         });
+-        first.unmap_impl(range, &mut first_pt.modify()).unwrap();
++        first
++            .unmap_impl(vma.range(), &mut first_pt.modify())
++            .unwrap();
+         second.unmap_impl(range, &mut second_pt.modify()).unwrap();
+         assert!(first.pins.lock().is_empty() && second.pins.lock().is_empty());
+     }
+@@ -1079,7 +1129,7 @@ mod tests {
+         let runtime = fault_read_runtime(file.clone(), None);
+         let mut table = PageTable::try_new().unwrap();
+         cache_read_fault(&runtime, &mut table, 0);
+-        let weak = Arc::downgrade(runtime.pins.lock().get(&0).unwrap());
++        let weak = Arc::downgrade(runtime.pins.lock().get(&0).unwrap().owner());
+         let pa = table.query(runtime.start).unwrap().0;
+         file.mapping().truncate_final().unwrap();
+         assert!(weak.upgrade().is_some());
+diff --git a/mm/filemap/src/runtime.rs b/mm/filemap/src/runtime.rs
+index a0cd24c33..bf348f6e9 100644
+--- a/mm/filemap/src/runtime.rs
++++ b/mm/filemap/src/runtime.rs
+@@ -6,11 +6,13 @@ use alloc::sync::Arc;
+ 
+ use kerrno::KResult;
+ use khal::paging::{MappingFlags, PageSize};
++use ksync::Mutex;
+ use kvfs::{AddressSpace, AddressSpaceViewGuard, VfsFile};
+-use memaddr::VirtAddr;
++use memaddr::{PhysAddr, VirtAddr};
+ use memspace::{
+     FileMappingInfo, InvalidateHandle, MmObserver, VmArea, VmBackingInfo, VmRuntimeRef,
+ };
++use pagecache::Folio;
+ use vmobj::{MappingViewKind, MappingViewSpec, VmObjectId};
+ 
+ use crate::{
+@@ -37,6 +39,31 @@ pub(crate) struct FileRuntimeContext<'a> {
+     pub invalidate: InvalidateHandle,
+ }
+ 
++/// Retains a mapped folio and its immutable physical identity.
++#[derive(Clone)]
++pub(crate) struct FolioPin {
++    owner: Arc<Mutex<Folio>>,
++    paddr: PhysAddr,
++}
++
++impl FolioPin {
++    /// Capture the frame while holding this owner's folio guard.
++    pub(crate) fn new(owner: &Arc<Mutex<Folio>>, folio: &Folio) -> Self {
++        Self {
++            owner: owner.clone(),
++            paddr: folio.paddr(),
++        }
++    }
++
++    pub(crate) fn owner(&self) -> &Arc<Mutex<Folio>> {
++        &self.owner
++    }
++
++    pub(crate) fn paddr(&self) -> PhysAddr {
++        self.paddr
++    }
++}
++
+ pub(crate) struct AddressSpaceViewSpec {
+     pub mm_id: u64,
+     pub start: VirtAddr,
+diff --git a/mm/filemap/src/shared.rs b/mm/filemap/src/shared.rs
+index e43cfa749..166f07fa4 100644
+--- a/mm/filemap/src/shared.rs
++++ b/mm/filemap/src/shared.rs
+@@ -3,24 +3,25 @@
+ // See LICENSES for license details.
+ 
+ use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
++use core::ops::Range;
+ 
+ use kerrno::{KError, KResult};
+ use khal::paging::{MappingFlags, PageSize, PageTableMut, PagingError};
+ use ksync::Mutex;
+ use kvfs::{FMode, VfsFile};
+-use memaddr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
++use memaddr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
+ use memfs::shmem;
+ use memspace::{
+     FaultContext, ForkCloneTarget, InvalidateHandle, MmSpace, MsyncPolicy, MsyncRuntimeResult,
+-    VmArea, VmBackingInfo, VmBackingKind, VmRuntimeOps, VmRuntimeRef,
++    ResidentSpanSource, VmArea, VmBackingInfo, VmBackingKind, VmRuntimeOps, VmRuntimeRef,
+     backend::{FaultCompletion, FaultCompletionResult, map_paging_err, pages_in},
+ };
+-use pagecache::{Folio, PageIndex};
++use pagecache::PageIndex;
+ 
+-use crate::runtime::{SharedFileSourceAdapter, SharedFileSourceSpec};
++use crate::runtime::{FolioPin, SharedFileSourceAdapter, SharedFileSourceSpec};
+ 
+ /// References retained independently of cache residency until PTE removal and flush.
+-type PinnedFolios = BTreeMap<PageIndex, Arc<Mutex<Folio>>>;
++type PinnedFolios = BTreeMap<PageIndex, FolioPin>;
+ 
+ pub(crate) struct FileSharedRuntimeInner {
+     source: SharedFileSourceAdapter,
+@@ -170,6 +171,14 @@ impl FileSharedRuntime {
+         self.0.object_id()
+     }
+ 
++    fn pin_indices(vma: &VmArea) -> KResult<Range<PageIndex>> {
++        let first = vma.page_offset();
++        let end = first
++            .checked_add((vma.size() / PAGE_SIZE_4K) as u64)
++            .ok_or(KError::BadAddress)?;
++        Ok(first..end)
++    }
++
+     fn check_flags(&self, flags: MappingFlags) -> KResult {
+         let mut required_flags = FMode::empty();
+         if flags.contains(MappingFlags::READ) {
+@@ -324,7 +333,7 @@ impl FileSharedRuntime {
+                         pgtbl
+                             .remap(addr, folio.paddr(), flags)
+                             .map_err(map_paging_err)?;
+-                        let released = self.0.pins.lock().insert(pn, owner.clone());
++                        let released = self.0.pins.lock().insert(pn, FolioPin::new(owner, folio));
+                         pgtbl.finish();
+                         drop(released);
+                         populated = 1;
+@@ -346,7 +355,7 @@ impl FileSharedRuntime {
+                         .map_err(map_paging_err)?;
+                     // The closure owns the folio while the PTE is published;
+                     // this pin keeps it alive after the closure returns.
+-                    self.0.pins.lock().insert(pn, owner.clone());
++                    self.0.pins.lock().insert(pn, FolioPin::new(owner, folio));
+                     populated = 1;
+                     Ok(())
+                 })?;
+@@ -383,17 +392,29 @@ impl FileSharedRuntime {
+ 
+ impl VmRuntimeOps for FileSharedRuntime {
+     fn resident_bytes(&self, vma: &VmArea) -> KResult<Option<usize>> {
+-        let first = vma.page_offset();
+-        let end = first
+-            .checked_add((vma.size() / PAGE_SIZE_4K) as u64)
+-            .ok_or(KError::BadAddress)?;
++        let indices = Self::pin_indices(vma)?;
+         // Pins belong to this runtime view; fork starts with an empty map.
+         // A shared cache folio faulted only by another mm is never counted.
+         Ok(Some(
+-            self.0.pins.lock().range(first..end).count() * PAGE_SIZE_4K,
++            self.0.pins.lock().range(indices).count() * PAGE_SIZE_4K,
+         ))
+     }
+ 
++    fn visit_resident_spans(
++        &self,
++        vma: &VmArea,
++        visit: &mut dyn FnMut(VirtAddr, PhysAddr, usize),
++    ) -> KResult<ResidentSpanSource> {
++        let indices = Self::pin_indices(vma)?;
++        let first = indices.start;
++        let pins = self.0.pins.try_lock().ok_or(KError::WouldBlock)?;
++        for (&index, pin) in pins.range(indices) {
++            let addr = vma.start() + (index - first) as usize * PAGE_SIZE_4K;
++            visit(addr, pin.paddr(), PAGE_SIZE_4K);
++        }
++        Ok(ResidentSpanSource::Owned)
++    }
++
+     fn backing_info(&self) -> VmBackingInfo {
+         self.backing_info_impl()
+     }
+@@ -445,14 +466,13 @@ impl VmRuntimeOps for FileSharedRuntime {
+         aspace: &Arc<Mutex<MmSpace>>,
+         invalidate: Option<InvalidateHandle>,
+     ) -> KResult<Arc<dyn VmRuntimeOps>> {
+-        let first = source.page_offset();
+-        let end = first + (source.size() / PAGE_SIZE_4K) as u64;
++        let indices = Self::pin_indices(source)?;
+         let pins = self
+             .0
+             .pins
+             .lock()
+-            .range(first..end)
+-            .map(|(index, folio)| (*index, folio.clone()))
++            .range(indices)
++            .map(|(index, pin)| (*index, pin.clone()))
+             .collect();
+         // Separate references make destination rollback independent of source
+         // PTEs. Successful relocation releases source pins after move_pages.
+@@ -692,8 +712,13 @@ mod tests {
+         let len = 1usize << 44;
+         let start = VirtAddr::from_usize(0x4000);
+         let mut pins = BTreeMap::new();
+-        pins.insert(0, first);
+-        pins.insert((len / PAGE_SIZE_4K - 1) as u64, last);
++        pins.insert(0, super::FolioPin::new(&first, &first.lock()));
++        pins.insert(
++            (len / PAGE_SIZE_4K - 1) as u64,
++            super::FolioPin::new(&last, &last.lock()),
++        );
++        drop(first);
++        drop(last);
+         let inner = FileSharedRuntimeInner {
+             source: SharedFileSourceAdapter::new_without_view(file, 1, start, len, 0),
+             shared_ranges: Mutex::new(Vec::new()),
+@@ -848,6 +873,16 @@ mod tests {
+             let mut data = [0];
+             guard.read(target, &mut data).expect("read relocated frame");
+             assert_eq!(data, [0x5a]);
++            let left_va = VirtAddr::from_usize(0x4000);
++            let left_pa = guard.page_table().query(left_va).unwrap().0;
++            let target_pa = guard.page_table().query(target).unwrap().0;
++            let mut spans = Vec::new();
++            guard
++                .visit_resident_spans(|va, pa, bytes| spans.push((va, pa, bytes)))
++                .unwrap();
++            assert_eq!(spans.len(), 2);
++            assert!(spans.contains(&(left_va, left_pa, PAGE_SIZE_4K)));
++            assert!(spans.contains(&(target, target_pa, PAGE_SIZE_4K)));
+             // Cache and destination own one reference each; source retirement
+             // must not leave a pin in the left segment's shared runtime.
+             assert_eq!(right.strong_count(), 2);
+diff --git a/mm/memspace/docs/design.md b/mm/memspace/docs/design.md
+index 5039f865d..1245eae9d 100644
+--- a/mm/memspace/docs/design.md
++++ b/mm/memspace/docs/design.md
+@@ -259,9 +259,9 @@ dirty tracking.
+ ## 并发模型
+ 
+ - `MmSpace` 由外层锁串行化。
+-- `MmUserHandle` 的 user-count 状态转换不依赖 `MmSpace` 主锁；从裸
+-  `Arc<Mutex<MmSpace>>` mint handle 时会短暂读取 mm-owned lifetime，最后一个
+-  user 释放时会获取 `MmSpace` 主锁并执行 `clear()`。
++- 首次获取 `MmUserHandle` 时，持有 `MmSpace` 主锁登记该地址空间的弱引用，
++  然后返回 handle。最后一个 user 释放时，在同一主锁下完成 `clear()` 和注销。
++  已有用户的 clone 只更新原子引用计数。
+ - `MmUserHandle::clone_user_unless_zero()` 与最后一个 user release 通过同一个原子
+   状态转换互斥；一旦进入 torn-down 状态，后续 `MmPin` 不能再升级为 active user。
+ - `MmCpuResidency` 由 `MmSpace` 拥有，用于记录“哪些 CPU 可能还保留该地址空间
+@@ -355,6 +355,17 @@ MADV_DONTNEED、clear 删除 owner 后，下一次快照反映释放结果。
+ 复刻。未实现 anon/file/shmem 分类、VmHWM 或 PSS，不输出假分类值。单个
+ 地址空间内快照由 mutex 串行化，但多个 Chromium 进程的采样不是全局原子快照。
+ 
++`visit_resident_spans()` 为内核记账调用者枚举同一地址空间的驻留映射。匿名私有
++页槽、共享匿名页及 owned linear 范围从 owner 取得 PA，并按当前 VMA 边界裁剪。
++没有驻留 owner 的普通线性映射通过稀疏页表访客枚举。文件 runtime 通过同一个
++`VmRuntimeOps` hook 接入。缺少实现的 runtime 返回 `OperationNotSupported`，
++调用者必须丢弃本次未完整的观测。RSS 仍使用独立的字节统计路径，无需遍历 PA。
++
++系统范围的驻留快照以活跃 MM 注册表为准。共享一个 `MmSpace` 的多个任务只在
++表中保留一个条目。采样复制弱引用并释放注册表锁，再取得各 MM 的对象引用，
++逐个尝试取得主锁。捕获结束时仍持有这些锁，重新检查注册表版本。版本一致时，
++收集到的映射在共同的持锁区间内同时成立。锁竞争或成员变化会使本次采样失败。
++注册表只在地址空间首个用户获取和最后一个用户清理时修改，不参与每页缺页或 COW。
+ 
+ ## 有独立 owner 的线性映射
+ 
+diff --git a/mm/memspace/docs/security.md b/mm/memspace/docs/security.md
+index 62057e83f..2a9d76510 100644
+--- a/mm/memspace/docs/security.md
++++ b/mm/memspace/docs/security.md
+@@ -82,6 +82,8 @@
+   不能在 page-table flush 路径中重建目标集合。
+ - `MmUserHandle::clone_user_unless_zero()` 和最后一个 user release 使用同一个原子
+   状态转换；进入 torn-down 状态后，`MmPin::try_upgrade_user()` 必须失败。
++- 活跃 MM 注册表的唯一阻塞锁序是 `MmSpace → registry`。采样复制弱引用后
++  释放 registry，之后才尝试取得各 MM 锁。版本复核也使用 `try_lock`。
+ 
+ ## 威胁分析
+ 
+@@ -216,6 +218,16 @@ Linear VMA 的 `max_flags` 允许 DEVICE 属性，并不说明当前映射是设
+ 不得把 max_flags.DEVICE 用作驻留页排除条件。设备/普通 RAM 同时映射的回归
+ 保留这一差别，防止漏计 signal trampoline 等普通 Linear RAM。
+ 
++驻留 span 访客遵循相同的任务上下文和用户／设备映射过滤条件。回调可能运行在
++MM 与 owner 锁共同持有时，因此只做记账，不重入这些锁、不发起文件 I/O，也不向
++用户态导出物理地址。访客不持有独立 frame pin。未实现的 runtime 或遍历失败会使
++整次采集失败，已经访问的 span 不能作为完整结果。
++
++系统采样只能把 registry 中的弱引用升级为对象引用。`MmUserHandle` 会延长
++resident mappings 的生命周期，不能充当采样引用。最后一个 user 的注销须在
++清理后完成，使 PFN 关联在共同持锁期间保持有效。持多个 MM guard 时，访客对
++owner 也只能尝试非阻塞取锁。不能在回调中取另一把 MM 锁、执行 I/O、拷贝到
++用户缓冲或直接发布结果。锁竞争、弱引用失效、版本耗尽或版本变化均拒绝观测。
+ 
+ ## Owned linear 的不安全构造与回滚
+ 
+diff --git a/mm/memspace/src/aspace.rs b/mm/memspace/src/aspace.rs
+index 6e16eecab..3c9fbe461 100644
+--- a/mm/memspace/src/aspace.rs
++++ b/mm/memspace/src/aspace.rs
+@@ -62,7 +62,7 @@ use crate::{
+     backend::{FaultCompletionResult, map_paging_err, pages_in},
+     cpu_residency::{MmCpuResidency, MmCpuResidencyRef},
+     lifetime::{MmUserHandle, MmUserLifetime},
+-    vma::VmRuntimeRef,
++    vma::{ResidentSpanSource, VmRuntimeRef},
+ };
+ 
+ #[cfg(all(feature = "smp", not(target_arch = "aarch64")))]
+@@ -1767,6 +1767,56 @@ impl MmSpace {
+         Ok(snapshot)
+     }
+ 
++    /// Visits the physical spans of resident user RAM in this address space.
++    ///
++    /// Call with the outer MM mutex held in sleepable task context. The visitor
++    /// receives `(VA, PA, bytes)` for each span, with aliases reported at their
++    /// distinct virtual addresses. The walk includes owner-held pages retained
++    /// across `PROT_NONE`. It excludes kernel-only and `DEVICE` mappings and
++    /// does not fault in pages or grant an independent pin on a frame.
++    /// The callback runs under MM and possibly page-owner locks. It may
++    /// accumulate statistics but must not reenter those locks or export PAs.
++    ///
++    /// # Errors
++    ///
++    /// Fails when a runtime lacks span enumeration or the walk encounters
++    /// invalid mapping metadata. Earlier spans may already have been visited.
++    /// Discard a partial result after an error.
++    pub fn visit_resident_spans(
++        &self,
++        mut visit: impl FnMut(VirtAddr, PhysAddr, usize),
++    ) -> KResult<()> {
++        for vma in self.vmas.iter() {
++            self.visit_vma_resident_spans(vma, &mut visit)?;
++        }
++        Ok(())
++    }
++
++    pub(crate) fn visit_vma_resident_spans(
++        &self,
++        vma: &VmArea,
++        visit: &mut dyn FnMut(VirtAddr, PhysAddr, usize),
++    ) -> KResult<()> {
++        if !vma.max_flags().contains(MappingFlags::USER)
++            || vma.flags().contains(MappingFlags::DEVICE)
++        {
++            return Ok(());
++        }
++        let runtime = self.runtime_for_vma(vma).ok_or(KError::BadAddress)?;
++        if runtime.visit_resident_spans(vma, visit)? == ResidentSpanSource::PageTable {
++            self.pgtbl
++                .visit_present_spans_in_range(
++                    vma.start(),
++                    vma.size(),
++                    MappingFlags::USER,
++                    MappingFlags::DEVICE,
++                    visit,
++                )
++                .map_err(map_paging_err)?;
++        }
++        Ok(())
++    }
++
+     /// Returns VMA views with explicit backing descriptions.
+     pub fn vmas(&self) -> impl Iterator<Item = &VmArea> {
+         self.vmas.iter()
+@@ -1875,6 +1925,11 @@ mod tests {
+             mm.resident_memory_snapshot().unwrap().resident_bytes,
+             PAGE_SIZE_4K * 3
+         );
++        let expected_spans = [0, PAGE_SIZE_4K, len - PAGE_SIZE_4K].map(|offset| {
++            let addr = start + offset;
++            let (pa, ..) = mm.page_table().query(addr).unwrap();
++            (addr, pa, PAGE_SIZE_4K)
++        });
+         mm.protect(start + PAGE_SIZE_4K, PAGE_SIZE_4K, MappingFlags::empty())
+             .expect("protect middle page to NONE and split VMA");
+         assert!(matches!(
+@@ -1885,6 +1940,10 @@ mod tests {
+             mm.resident_memory_snapshot().unwrap().resident_bytes,
+             PAGE_SIZE_4K * 3
+         );
++        let mut spans = Vec::new();
++        mm.visit_resident_spans(|va, pa, bytes| spans.push((va, pa, bytes)))
++            .unwrap();
++        assert_eq!(spans.as_slice(), &expected_spans);
+         mm.protect(start + PAGE_SIZE_4K, PAGE_SIZE_4K, flags)
+             .expect("restore permission");
+         mm.populate_area(start + PAGE_SIZE_4K, PAGE_SIZE_4K, flags)
+@@ -1968,6 +2027,15 @@ mod tests {
+                 resident_bytes: PAGE_SIZE_4K,
+             }
+         );
++        let mut span = None;
++        let mut count = 0;
++        mm.visit_resident_spans(|va, pa, bytes| {
++            span = Some((va, pa, bytes));
++            count += 1;
++        })
++        .unwrap();
++        assert_eq!(count, 1);
++        assert_eq!(span, Some((start, frame, PAGE_SIZE_4K)));
+         mm.clear();
+         crate::backend::dealloc_frame(frame, PageSize::Size4K);
+     }
+diff --git a/mm/memspace/src/backend/linear.rs b/mm/memspace/src/backend/linear.rs
+index 213d817a4..be5d8644d 100644
+--- a/mm/memspace/src/backend/linear.rs
++++ b/mm/memspace/src/backend/linear.rs
+@@ -12,7 +12,8 @@ use memaddr::{MemoryAddr, PhysAddr, PhysAddrRange, VirtAddr, VirtAddrRange};
+ 
+ use super::owned_linear::{OwnedLinearMapping, OwnedPhysicalMemory};
+ use crate::{
+-    FaultContext, ForkCloneTarget, InvalidateHandle, MmSpace, VmBackingInfo, VmBackingKind,
++    FaultContext, ForkCloneTarget, InvalidateHandle, MmSpace, ResidentSpanSource, VmBackingInfo,
++    VmBackingKind,
+     backend::{BackendOps, FaultCompletion, FaultCompletionResult, map_paging_err, pages_in},
+     vma::VmRuntimeOps,
+ };
+@@ -185,6 +186,23 @@ impl VmRuntimeOps for LinearBackend {
+         }
+     }
+ 
++    fn visit_resident_spans(
++        &self,
++        vma: &crate::VmArea,
++        visit: &mut dyn FnMut(VirtAddr, PhysAddr, usize),
++    ) -> KResult<ResidentSpanSource> {
++        let Some(mapping) = &self.owned else {
++            return Ok(ResidentSpanSource::PageTable);
++        };
++        mapping.validate_range(vma.range())?;
++        visit(
++            vma.start(),
++            mapping.physical_address(vma.start())?,
++            vma.size(),
++        );
++        Ok(ResidentSpanSource::Owned)
++    }
++
+     fn allows_mremap(&self) -> bool {
+         self.owned.is_none()
+     }
+diff --git a/mm/memspace/src/backend/owned_linear_tests.rs b/mm/memspace/src/backend/owned_linear_tests.rs
+index 6a29ee32a..8dd6ce040 100644
+--- a/mm/memspace/src/backend/owned_linear_tests.rs
++++ b/mm/memspace/src/backend/owned_linear_tests.rs
+@@ -263,6 +263,15 @@ fn owned_linear_prot_none_retains_ram_restores_on_fault_and_clear_releases_pin()
+         mm.resident_memory_snapshot().unwrap().resident_bytes,
+         PAGE_SIZE_4K
+     );
++    let mut span = None;
++    let mut count = 0;
++    mm.visit_resident_spans(|va, pa, bytes| {
++        span = Some((va, pa, bytes));
++        count += 1;
++    })
++    .unwrap();
++    assert_eq!(count, 1);
++    assert_eq!(span, Some((start, physical, PAGE_SIZE_4K)));
+     assert_eq!(
+         mm.handle_page_fault(start, PageFaultFlags::USER | PageFaultFlags::READ),
+         PageFaultOutcome::AccessDenied
+diff --git a/mm/memspace/src/backend/private.rs b/mm/memspace/src/backend/private.rs
+index c51a747c6..fc7c72275 100644
+--- a/mm/memspace/src/backend/private.rs
++++ b/mm/memspace/src/backend/private.rs
+@@ -15,7 +15,7 @@ use khal::{
+     paging::{MappingFlags, PageSize, PageTableMut, PagingError},
+ };
+ use ksync::Mutex;
+-use memaddr::{MemoryAddr, VirtAddr, VirtAddrRange};
++use memaddr::{MemoryAddr, PhysAddr, VirtAddr, VirtAddrRange};
+ use page_table::PteReplaceError;
+ use vmobj::{
+     MappingViewId, MappingViewKind, MappingViewNotifier, MappingViewSpec, ObjectInvalidateWork,
+@@ -24,7 +24,8 @@ use vmobj::{
+ 
+ use super::{alloc_frame, dealloc_frame, map_paging_err};
+ use crate::{
+-    FaultContext, ForkCloneTarget, InvalidateHandle, MmSpace, VmArea, VmBackingInfo, VmBackingKind,
++    FaultContext, ForkCloneTarget, InvalidateHandle, MmSpace, ResidentSpanSource, VmArea,
++    VmBackingInfo, VmBackingKind,
+     backend::{BackendOps, FaultCompletion, FaultCompletionResult},
+     vma::VmRuntimeOps,
+ };
+@@ -272,6 +273,19 @@ impl VmRuntimeOps for PrivateBackend {
+             .map(Some)
+     }
+ 
++    fn visit_resident_spans(
++        &self,
++        vma: &VmArea,
++        visit: &mut dyn FnMut(VirtAddr, PhysAddr, usize),
++    ) -> KResult<ResidentSpanSource> {
++        let offset = self.object_offset_for(vma.start())?;
++        self.object
++            .visit_resident_spans_in_range(offset, vma.size(), |start, pa, bytes| {
++                visit(vma.start() + (start - offset) as usize, pa, bytes);
++            })?;
++        Ok(ResidentSpanSource::Owned)
++    }
++
+     fn backing_info(&self) -> VmBackingInfo {
+         BackendOps::backing_info(self)
+     }
+diff --git a/mm/memspace/src/backend/shared.rs b/mm/memspace/src/backend/shared.rs
+index 6ab2ceba1..d91528b0b 100644
+--- a/mm/memspace/src/backend/shared.rs
++++ b/mm/memspace/src/backend/shared.rs
+@@ -18,7 +18,8 @@ use vmobj::{
+ 
+ use super::{alloc_frame, dealloc_frame};
+ use crate::{
+-    FaultContext, ForkCloneTarget, InvalidateHandle, MmSpace, VmArea, VmBackingInfo, VmBackingKind,
++    FaultContext, ForkCloneTarget, InvalidateHandle, MmSpace, ResidentSpanSource, VmArea,
++    VmBackingInfo, VmBackingKind,
+     backend::{
+         BackendOps, FaultCompletion, FaultCompletionResult, divide_page, map_paging_err, pages_in,
+     },
+@@ -169,6 +170,25 @@ impl SharedBackend {
+     fn page_for(&self, addr: VirtAddr) -> Option<PhysAddr> {
+         self.pages_starting_from(addr).first().copied()
+     }
++
++    fn resident_extent(&self, vma: &VmArea) -> KResult<(usize, usize)> {
++        let offset = vma
++            .start()
++            .as_usize()
++            .checked_sub(self.start.as_usize())
++            .ok_or(KError::BadAddress)?;
++        // The eagerly allocated array is fixed; another mm's faults do not
++        // materialize more pages for this view.
++        let allocated_bytes = self
++            .pages
++            .len()
++            .checked_mul(self.pages.size as usize)
++            .ok_or(KError::BadAddress)?;
++        Ok((
++            offset,
++            allocated_bytes.saturating_sub(offset).min(vma.size()),
++        ))
++    }
+ }
+ 
+ struct SharedAnonInvalidate {
+@@ -269,19 +289,27 @@ impl BackendOps for SharedBackend {
+ 
+ impl VmRuntimeOps for SharedBackend {
+     fn resident_bytes(&self, vma: &VmArea) -> KResult<Option<usize>> {
+-        let offset = vma
+-            .start()
+-            .as_usize()
+-            .checked_sub(self.start.as_usize())
+-            .ok_or(KError::BadAddress)?;
+-        // SharedPages is an immutable, eagerly allocated array: another mm's
+-        // faults cannot add pages that this mapping has never owned.
+-        let allocated_bytes = self
+-            .pages
+-            .len()
+-            .checked_mul(self.pages.size as usize)
+-            .ok_or(KError::BadAddress)?;
+-        Ok(Some(allocated_bytes.saturating_sub(offset).min(vma.size())))
++        let (_, bytes) = self.resident_extent(vma)?;
++        Ok(Some(bytes))
++    }
++
++    fn visit_resident_spans(
++        &self,
++        vma: &VmArea,
++        visit: &mut dyn FnMut(VirtAddr, PhysAddr, usize),
++    ) -> KResult<ResidentSpanSource> {
++        let (offset, bytes) = self.resident_extent(vma)?;
++        let page_bytes = self.pages.size as usize;
++        let mut visited = 0;
++        while visited < bytes {
++            let backing_offset = offset + visited;
++            let in_page = backing_offset % page_bytes;
++            let length = (page_bytes - in_page).min(bytes - visited);
++            let pa = self.pages[backing_offset / page_bytes] + in_page;
++            visit(vma.start() + visited, pa, length);
++            visited += length;
++        }
++        Ok(ResidentSpanSource::Owned)
+     }
+ 
+     fn backing_info(&self) -> VmBackingInfo {
+diff --git a/mm/memspace/src/lib.rs b/mm/memspace/src/lib.rs
+index aef41c3bb..0c07e3bd4 100644
+--- a/mm/memspace/src/lib.rs
++++ b/mm/memspace/src/lib.rs
+@@ -18,6 +18,7 @@ mod cpu_residency;
+ mod fault;
+ mod iomap;
+ mod lifetime;
++mod pss;
+ mod vma;
+ 
+ pub use backend::{OwnedMappingCache, OwnedMappingVisibility, OwnedPhysicalMemory};
+@@ -46,9 +47,11 @@ pub use self::{
+         register_device_region, register_fixed_device_region,
+     },
+     lifetime::MmObserver,
++    pss::{ResidentPssArea, ResidentPssSnapshot, resident_pss_snapshot},
+     vma::{
+-        FileMappingInfo, ForkCloneTarget, MsyncPolicy, MsyncRuntimeResult, VmArea, VmAreaSet,
+-        VmBackingInfo, VmBackingKind, VmInheritance, VmMayPerm, VmPerm, VmRuntimeOps, VmRuntimeRef,
++        FileMappingInfo, ForkCloneTarget, MsyncPolicy, MsyncRuntimeResult, ResidentSpanSource,
++        VmArea, VmAreaSet, VmBackingInfo, VmBackingKind, VmInheritance, VmMayPerm, VmPerm,
++        VmRuntimeOps, VmRuntimeRef,
+     },
+ };
+ 
+diff --git a/mm/memspace/src/lifetime.rs b/mm/memspace/src/lifetime.rs
+index 08c031036..7c9d00871 100644
+--- a/mm/memspace/src/lifetime.rs
++++ b/mm/memspace/src/lifetime.rs
+@@ -4,13 +4,117 @@
+ 
+ //! User and pin lifetime capabilities for process address spaces.
+ 
+-use alloc::sync::Arc;
++use alloc::{
++    collections::BTreeMap,
++    sync::{Arc, Weak},
++    vec::Vec,
++};
+ use core::sync::atomic::{AtomicUsize, Ordering};
+ 
+-use ksync::Mutex;
++use kerrno::{KError, KResult};
++use ksync::{Mutex, MutexGuard, static_lock};
+ 
+ use crate::{InvalidateHandle, MmSpace};
+ 
++struct ActiveUserAddressSpaces {
++    epoch: u64,
++    spaces: BTreeMap<u64, Weak<Mutex<MmSpace>>>,
++}
++
++impl ActiveUserAddressSpaces {
++    const fn new() -> Self {
++        Self {
++            epoch: 0,
++            spaces: BTreeMap::new(),
++        }
++    }
++
++    fn register(&mut self, id: u64, address_space: Weak<Mutex<MmSpace>>) {
++        let previous = self.spaces.insert(id, address_space);
++        assert!(
++            previous.is_none(),
++            "first user registered an active address space"
++        );
++        self.epoch = self.epoch.saturating_add(1);
++    }
++
++    fn unregister(&mut self, id: u64) {
++        let previous = self.spaces.remove(&id);
++        assert!(
++            previous.is_some(),
++            "final user cleared an unregistered address space"
++        );
++        self.epoch = self.epoch.saturating_add(1);
++    }
++}
++
++static_lock! {
++    static ACTIVE_USER_ADDRESS_SPACES: Mutex<ActiveUserAddressSpaces> =
++        Mutex::new(ActiveUserAddressSpaces::new());
++}
++
++/// Captures a consistent view of the registered userspace mapping owners.
++///
++/// The caller must run in sleepable task context without holding an MM lock.
++/// During `capture` all registered MM mutexes are held. The callback may
++/// inspect the frozen mappings using nonblocking owner lock acquisition, but
++/// must not perform I/O, call back into MM locking, or publish results directly.
++/// Membership is rechecked before results can escape the freeze.
++///
++/// Weak registry entries are upgraded only to object references. The capture
++/// does not take extra active-user references or postpone teardown beyond the
++/// interval in which the MM guards are held.
++///
++/// # Errors
++///
++/// Returns [`KError::WouldBlock`] if a lock cannot be acquired immediately,
++/// membership changes, or an entry has been retired during setup. Storage
++/// allocation failure and callback errors are propagated.
++pub(crate) fn with_frozen_user_address_spaces<R>(
++    capture: impl FnOnce(&[MutexGuard<'_, MmSpace>]) -> KResult<R>,
++) -> KResult<R> {
++    let (epoch, members) = {
++        let registry = ACTIVE_USER_ADDRESS_SPACES
++            .try_lock()
++            .ok_or(KError::WouldBlock)?;
++        if registry.epoch == u64::MAX {
++            return Err(KError::WouldBlock);
++        }
++        let mut members = Vec::new();
++        members
++            .try_reserve_exact(registry.spaces.len())
++            .map_err(|_| KError::NoMemory)?;
++        members.extend(registry.spaces.values().cloned());
++        (registry.epoch, members)
++    };
++    let mut spaces = Vec::new();
++    spaces
++        .try_reserve_exact(members.len())
++        .map_err(|_| KError::NoMemory)?;
++    for member in members {
++        spaces.push(member.upgrade().ok_or(KError::WouldBlock)?);
++    }
++    let mut guards = Vec::new();
++    guards
++        .try_reserve_exact(spaces.len())
++        .map_err(|_| KError::NoMemory)?;
++    for space in &spaces {
++        // The registry is unlocked here. A contended MM ends this attempt,
++        // rather than waiting while already holding other MM locks.
++        guards.push(space.try_lock().ok_or(KError::WouldBlock)?);
++    }
++    let captured = capture(&guards)?;
++    let membership_unchanged = ACTIVE_USER_ADDRESS_SPACES
++        .try_lock()
++        .is_some_and(|registry| registry.epoch == epoch);
++    drop(guards);
++    if membership_unchanged {
++        Ok(captured)
++    } else {
++        Err(KError::WouldBlock)
++    }
++}
++
+ pub(crate) struct MmUserLifetime {
+     state: AtomicUsize,
+ }
+@@ -25,7 +129,7 @@ impl MmUserLifetime {
+         }
+     }
+ 
+-    fn acquire_user(&self) -> bool {
++    fn acquire_user(&self) -> Option<bool> {
+         self.state
+             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                 if state & Self::TORN_DOWN != 0 || state == Self::USER_MASK {
+@@ -34,7 +138,8 @@ impl MmUserLifetime {
+                     Some(state + 1)
+                 }
+             })
+-            .is_ok()
++            .ok()
++            .map(|previous| previous == 0)
+     }
+ 
+     fn release_user(&self) -> bool {
+@@ -81,10 +186,16 @@ pub struct MmUserHandle {
+ 
+ impl MmUserHandle {
+     pub(crate) fn acquire(address_space: Arc<Mutex<MmSpace>>) -> Option<Self> {
+-        let lifetime = address_space.lock().user_lifetime().clone();
+-        if !lifetime.acquire_user() {
+-            return None;
++        let aspace = address_space.lock();
++        let lifetime = aspace.user_lifetime().clone();
++        if lifetime.acquire_user()? {
++            // A second acquire cannot return a usable handle until the
++            // first one has published this MM's weak registry entry.
++            ACTIVE_USER_ADDRESS_SPACES
++                .lock()
++                .register(aspace.mm_id(), Arc::downgrade(&address_space));
+         }
++        drop(aspace);
+ 
+         Some(Self {
+             address_space,
+@@ -108,9 +219,8 @@ impl MmUserHandle {
+     /// the same drop contract as [`MmUserHandle`].
+     pub fn clone_user_unless_zero(&self) -> Option<Self> {
+         let lifetime = self.lifetime.as_ref()?;
+-        if !lifetime.acquire_user() {
+-            return None;
+-        }
++        let is_first = lifetime.acquire_user()?;
++        debug_assert!(!is_first, "a live handle cannot create the first user");
+ 
+         Some(Self {
+             address_space: self.address_space.clone(),
+@@ -137,6 +247,10 @@ impl MmUserHandle {
+     /// context, or while the current task already holds this handle's
+     /// `MmSpace` mutex.
+     pub fn release_and_clear_if_last(mut self) -> bool {
++        self.release_user()
++    }
++
++    fn release_user(&mut self) -> bool {
+         let Some(lifetime) = self.lifetime.take() else {
+             return false;
+         };
+@@ -147,22 +261,16 @@ impl MmUserHandle {
+         self.address_space.assert_not_owned_by_current(
+             "MmUserHandle final release would relock the current task's MmSpace mutex",
+         );
+-        self.address_space.lock().clear();
++        let mut aspace = self.address_space.lock();
++        aspace.clear();
++        ACTIVE_USER_ADDRESS_SPACES.lock().unregister(aspace.mm_id());
+         true
+     }
+ }
+ 
+ impl Drop for MmUserHandle {
+     fn drop(&mut self) {
+-        let Some(lifetime) = self.lifetime.take() else {
+-            return;
+-        };
+-        if lifetime.release_user() {
+-            self.address_space.assert_not_owned_by_current(
+-                "MmUserHandle drop would relock the current task's MmSpace mutex",
+-            );
+-            self.address_space.lock().clear();
+-        }
++        self.release_user();
+     }
+ }
+ 
+@@ -179,9 +287,8 @@ pub struct MmPin {
+ impl MmPin {
+     /// Attempts to upgrade this object pin into an active user.
+     pub fn try_upgrade_user(&self) -> Option<MmUserHandle> {
+-        if !self.lifetime.acquire_user() {
+-            return None;
+-        }
++        let is_first = self.lifetime.acquire_user()?;
++        debug_assert!(!is_first, "an object pin cannot create the first user");
+ 
+         Some(MmUserHandle {
+             address_space: self.address_space.clone(),
+@@ -229,3 +336,59 @@ impl MmObserver {
+             .invalidate_handle(&self.address_space)
+     }
+ }
++
++#[cfg(unittest)]
++mod tests {
++    use alloc::sync::Arc;
++
++    use kerrno::KError;
++    use ksync::Mutex;
++    use memaddr::{PAGE_SIZE_4K, VirtAddr};
++    use unittest::def_test;
++
++    use super::{
++        ACTIVE_USER_ADDRESS_SPACES, MmSpace, MmUserHandle, with_frozen_user_address_spaces,
++    };
++
++    fn address_space() -> Arc<Mutex<MmSpace>> {
++        Arc::new(Mutex::new(
++            MmSpace::new_empty_user(VirtAddr::from_usize(0x4000), PAGE_SIZE_4K).unwrap(),
++        ))
++    }
++
++    #[def_test]
++    fn active_registry_tracks_one_mm_until_its_last_user_releases() {
++        let mm = address_space();
++        let id = mm.lock().mm_id();
++        let first = MmUserHandle::acquire(mm.clone()).unwrap();
++        let pin = first.pin();
++        let second = pin.try_upgrade_user().unwrap();
++        assert!(!first.release_and_clear_if_last());
++        assert!(
++            ACTIVE_USER_ADDRESS_SPACES
++                .lock()
++                .spaces
++                .get(&id)
++                .is_some_and(|member| member.ptr_eq(&Arc::downgrade(&mm)))
++        );
++        drop(second);
++        assert!(!ACTIVE_USER_ADDRESS_SPACES.lock().spaces.contains_key(&id));
++        assert!(pin.try_upgrade_user().is_none());
++        assert!(Arc::ptr_eq(pin.address_space(), &mm));
++    }
++
++    #[def_test]
++    fn frozen_capture_rejects_a_locked_registered_mm() {
++        let mm = address_space();
++        let user = MmUserHandle::acquire(mm.clone()).unwrap();
++        let locked = mm.lock();
++        assert_eq!(
++            with_frozen_user_address_spaces(|_| -> kerrno::KResult<()> {
++                panic!("a capture must not run while a registered MM is contended");
++            }),
++            Err(KError::WouldBlock)
++        );
++        drop(locked);
++        assert!(user.release_and_clear_if_last());
++    }
++}
+diff --git a/mm/memspace/src/vma.rs b/mm/memspace/src/vma.rs
+index 3dabe8ef9..44a89aa5d 100644
+--- a/mm/memspace/src/vma.rs
++++ b/mm/memspace/src/vma.rs
+@@ -14,7 +14,7 @@ use khal::{
+     trap::PageFaultFlags,
+ };
+ use ksync::Mutex;
+-use memaddr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange, is_aligned_4k};
++use memaddr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange, is_aligned_4k};
+ use vmobj::VmObjectId;
+ 
+ use crate::{
+@@ -27,6 +27,15 @@ use crate::{
+     },
+ };
+ 
++/// Source of the resident spans for one VMA.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ResidentSpanSource {
++    /// The runtime enumerated its owned spans, possibly none on a lazy mapping.
++    Owned,
++    /// This runtime has no owner-side residency. Walk its present PTEs instead.
++    PageTable,
++}
++
+ /// VMA-side execution operations.
+ ///
+ /// This is the Linux-aligned analogue of the `vm_operations_struct` role:
+@@ -54,6 +63,31 @@ pub trait VmRuntimeOps: Send + Sync {
+     fn resident_bytes(&self, _vma: &VmArea) -> KResult<Option<usize>> {
+         Ok(None)
+     }
++    /// Visits the resident physical spans retained by this runtime for `vma`.
++    ///
++    /// With the owning `MmSpace` mutex held in sleepable context, call `visit`
++    /// with nonempty, page-aligned `(VA, PA, bytes)` spans inside the current
++    /// VMA. Include materialized owners retained across `PROT_NONE` and only
++    /// report each VA page once. The callback must not reenter the runtime or
++    /// MM locks. It receives mapping identities rather than independent pins.
++    ///
++    /// Return [`ResidentSpanSource::PageTable`] without calling `visit` if
++    /// this runtime holds no owner-side residency and needs the present-PTE
++    /// walk. A runtime without a residency implementation must return an error
++    /// so callers do not silently omit owner-held frames.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`KError::OperationNotSupported`] when this runtime has not
++    /// implemented span enumeration, or an error for invalid mapping bounds.
++    fn visit_resident_spans(
++        &self,
++        _vma: &VmArea,
++        _visit: &mut dyn FnMut(VirtAddr, PhysAddr, usize),
++    ) -> KResult<ResidentSpanSource> {
++        Err(KError::OperationNotSupported)
++    }
++
+     fn map(&self, range: VirtAddrRange, flags: MappingFlags, pgtbl: &mut PageTableMut) -> KResult;
+     fn unmap(&self, range: VirtAddrRange, pgtbl: &mut PageTableMut) -> KResult;
+     /// Releases frame references after PTE removal and its completed TLB flush.
+@@ -294,6 +328,21 @@ impl VmRuntimeRef {
+         }
+     }
+ 
++    pub(crate) fn visit_resident_spans(
++        &self,
++        vma: &VmArea,
++        visit: &mut dyn FnMut(VirtAddr, PhysAddr, usize),
++    ) -> KResult<ResidentSpanSource> {
++        match self {
++            Self::Linear(inner) => inner.visit_resident_spans(vma, visit),
++            Self::AnonShared(inner) => inner.visit_resident_spans(vma, visit),
++            Self::AnonPrivate(inner) => inner.visit_resident_spans(vma, visit),
++            Self::FileShared(inner) | Self::FilePrivate(inner) => {
++                inner.visit_resident_spans(vma, visit)
++            }
++        }
++    }
++
+     pub(crate) fn register_object_views(
+         &self,
+         mm_id: u64,
+diff --git a/mm/page_table/docs/design.md b/mm/page_table/docs/design.md
+index 166905a99..845c379e5 100644
+--- a/mm/page_table/docs/design.md
++++ b/mm/page_table/docs/design.md
+@@ -366,11 +366,14 @@ traversal adapt to either layout.
+ 
+ ### Read-only sparse residency walk
+ 
+-`present_bytes_in_range` shares the sparse span decoder with sparse unmap, but
+-never changes an entry or flushes TLBs. It skips absent intermediate coverage,
+-visits allocated leaf entries, filters required/excluded mapping flags, and
+-counts only the intersection with huge leaves. Aliases count separately. This
+-primitive reports present PTE bytes, not backing-object ownership; memspace uses
+-owner-aware runtime queries for private/shared mappings retained across PROT_NONE.
+-Tests cover sparse terabyte ranges, aliases, huge clipping, flag filtering, invalid
+-bounds, three-level paging and bare-address intermediate table descriptors.
++`present_bytes_in_range` and `visit_present_spans_in_range` share the sparse span
++decoder with unmap. Their walk skips absent intermediate coverage and filters
++present leaves by mapping flags. The visitor reports the VA, corresponding PA,
++and byte count for each clipped intersection. Aliases have distinct VA spans
++and may report the same PA. The byte counter uses the span lengths without
++decoding physical addresses. Neither read path changes entries or flushes TLBs.
++
++These primitives describe present PTEs. `memspace` uses owner-aware runtime
++queries for mappings retained across `PROT_NONE`. Tests cover alias identity,
++both bounds of a clipped huge leaf, flag filtering, noncanonical bounds, and
++intermediate table descriptors that have no leaf present bit.
+diff --git a/mm/page_table/docs/security.md b/mm/page_table/docs/security.md
+index ebb7c2098..071107e70 100644
+--- a/mm/page_table/docs/security.md
++++ b/mm/page_table/docs/security.md
+@@ -350,11 +350,13 @@ When modifying this module, verify that:
+ - [ ] Sparse-unmap callers retain backing ownership on errors and explicitly
+       finalize pending invalidations before releasing frames.
+ 
+-The read-only `present_bytes_in_range` requires the same exclusion of concurrent
+-software page-table mutation as `query`. It validates aligned nonempty canonical
+-ranges before traversal; zero-length aligned ranges are no-ops. It reuses the
+-existing `table_of`/`next_table` trust boundary and introduces no unsafe block or
+-mutable PTE reference. The traversal follows intermediate descriptors according
+-to `next_table`, not a leaf-only present bit, and clips each step to the caller's
+-remaining range to avoid top-address overflow. It does not follow or count
+-non-present leaves as physical frames.
++The read-only byte count and span visitor require the same exclusion of
++concurrent software page-table mutation as `query`. The shared walk validates
++alignment and canonical bounds before traversal and treats aligned zero-length
++ranges as no-ops. It follows intermediate descriptors through the existing
++`next_table` contract, ignores non-present leaves, and clips each step to the
++caller-supplied range. The walk introduces no unsafe block or mutable PTE reference.
++
++The visitor reports physical addresses to kernel code for mapping accounting.
++It neither acquires frame ownership nor extends a mapping's lifetime. Callers
++keep the addresses inside the kernel and export aggregate statistics to userspace.
+diff --git a/mm/page_table/src/table64.rs b/mm/page_table/src/table64.rs
+index 2f97ef955..27f98cc79 100644
+--- a/mm/page_table/src/table64.rs
++++ b/mm/page_table/src/table64.rs
+@@ -292,12 +292,63 @@ impl<M: PagingMetaData, PTE: PageTableEntry, H: PagingHandler> PageTable64<M, PT
+         required: PagingFlags,
+         excluded: PagingFlags,
+     ) -> PtResult<usize> {
++        let mut resident_bytes = 0;
++        self.walk_present_spans_in_range(vaddr, size, required, excluded, |_, _, bytes, _| {
++            resident_bytes += bytes;
++        })?;
++        Ok(resident_bytes)
++    }
++
++    /// Visits the present mapping spans that match the required and excluded flags.
++    ///
++    /// Each call to `visit` receives the start virtual address, corresponding
++    /// physical address, and length in bytes of the intersection of one leaf
++    /// and the requested range. Calls are in ascending virtual address order.
++    /// Huge leaves are clipped at both range bounds and aliases are visited
++    /// separately. Absent subtrees and non-present leaves are skipped.
++    ///
++    /// The caller must exclude concurrent software page-table mutation. The
++    /// walk only reports translations and does not pin their backing frames.
++    /// It does not fault, allocate, modify entries, or flush TLBs.
++    ///
++    /// # Errors
++    ///
++    /// Returns `NotAligned` for non-4-KiB-aligned bounds, `InvalidAddress` for
++    /// overflowing or noncanonical nonempty ranges, or a page-table walk error.
++    /// A walk error may follow calls made for earlier spans.
++    pub fn visit_present_spans_in_range(
++        &self,
++        vaddr: M::VirtAddr,
++        size: usize,
++        required: PagingFlags,
++        excluded: PagingFlags,
++        mut visit: impl FnMut(M::VirtAddr, PhysAddr, usize),
++    ) -> PtResult<()> {
++        self.walk_present_spans_in_range(
++            vaddr,
++            size,
++            required,
++            excluded,
++            |cursor, offset, bytes, entry| {
++                visit(cursor.into(), entry.paddr().add(offset), bytes);
++            },
++        )
++    }
++
++    fn walk_present_spans_in_range(
++        &self,
++        vaddr: M::VirtAddr,
++        size: usize,
++        required: PagingFlags,
++        excluded: PagingFlags,
++        mut visit: impl FnMut(usize, usize, usize, &PTE),
++    ) -> PtResult<()> {
+         let start: usize = vaddr.into();
+         if !PageSize::Size4K.is_aligned(start) || !PageSize::Size4K.is_aligned(size) {
+             return Err(PtError::NotAligned);
+         }
+         if size == 0 {
+-            return Ok(0);
++            return Ok(());
+         }
+         let end = start.checked_add(size).ok_or(PtError::InvalidAddress)?;
+         if !M::vaddr_is_valid(start)
+@@ -307,19 +358,19 @@ impl<M: PagingMetaData, PTE: PageTableEntry, H: PagingHandler> PageTable64<M, PT
+             return Err(PtError::InvalidAddress);
+         }
+         let mut cursor = start;
+-        let mut resident_bytes = 0;
+         while cursor < end {
+             let (span, leaf) = self.sparse_span(cursor)?;
+-            let step = (span - (cursor & (span - 1))).min(end - cursor);
+-            if let Some((_size, flags)) = leaf
+-                && flags.contains(required)
+-                && !flags.intersects(excluded)
+-            {
+-                resident_bytes += step;
++            let offset = cursor & (span - 1);
++            let step = (span - offset).min(end - cursor);
++            if let Some(entry) = leaf {
++                let flags = entry.flags();
++                if flags.contains(required) && !flags.intersects(excluded) {
++                    visit(cursor, offset, step, entry);
++                }
+             }
+             cursor += step;
+         }
+-        Ok(resident_bytes)
++        Ok(())
+     }
+ 
+     /// Creates a mutable mapping view that tracks TLB flushes.
+@@ -382,23 +433,17 @@ impl<M: PagingMetaData, PTE: PageTableEntry, H: PagingHandler> PageTable64<M, PT
+     }
+ 
+     /// Returns the leaf size or coverage of the first absent walk entry.
+-    fn sparse_span(&self, vaddr: usize) -> PtResult<(usize, Option<(PageSize, PagingFlags)>)> {
++    fn sparse_span(&self, vaddr: usize) -> PtResult<(usize, Option<&PTE>)> {
+         let mut table = self.table_of(self.root_paddr());
+         for level in (1..=M::LEVELS).rev() {
+             let shift = 12 + 9 * (level - 1);
+             let span = 1usize << shift;
+             let entry = &table[(vaddr >> shift) & (ENTRY_COUNT - 1)];
+             if level == 1 || entry.is_huge() {
+-                let leaf_size = match level {
+-                    1 => PageSize::Size4K,
+-                    2 => PageSize::Size2M,
+-                    3 => PageSize::Size1G,
+-                    _ => return Err(PtError::MappedToHugePage),
+-                };
+-                return Ok((
+-                    span,
+-                    entry.is_present().then_some((leaf_size, entry.flags())),
+-                ));
++                if level > 3 {
++                    return Err(PtError::MappedToHugePage);
++                }
++                return Ok((span, entry.is_present().then_some(entry)));
+             }
+             // Table descriptors need not carry a leaf present bit (for
+             // example LoongArch stores a bare table address). Reuse the
+@@ -899,9 +944,9 @@ impl<'a, M: PagingMetaData, PTE: PageTableEntry, H: PagingHandler> PageTableMut<
+         let mut cursor = start;
+         while cursor < end {
+             let (span, leaf) = self.inner.sparse_span(cursor)?;
+-            let leaf_size = leaf.map(|(size, _flags)| size);
+-            if let Some(leaf_size) = leaf_size {
+-                if !leaf_size.is_aligned(cursor) || end - cursor < span {
++            let offset = cursor & (span - 1);
++            if leaf.is_some() {
++                if offset != 0 || end - cursor < span {
+                     return Err(PtError::MappedToHugePage);
+                 }
+                 self.unmap(cursor.into())?;
+@@ -909,7 +954,7 @@ impl<'a, M: PagingMetaData, PTE: PageTableEntry, H: PagingHandler> PageTableMut<
+             } else {
+                 // Subtract before adding to avoid overflow at the top of the
+                 // virtual address space, and never step past the caller's end.
+-                cursor += (span - (cursor & (span - 1))).min(end - cursor);
++                cursor += (span - offset).min(end - cursor);
+             }
+         }
+         Ok(())
+@@ -1390,6 +1435,8 @@ mod tests {
+         use alloc::alloc::{alloc_zeroed, dealloc};
+         use core::alloc::Layout;
+ 
++        use arrayvec::ArrayVec;
++
+         use super::{
+             PageSize, PageTable64, PagingFlags, PagingHandler, PagingMetaData, PhysAddr, TestEntry,
+             TestFrame, VirtAddr, def_test, paddr, vaddr,
+@@ -1435,7 +1482,7 @@ mod tests {
+             PageTable64<SparseMeta<LEVELS>, TestEntry, SparseHandler>;
+ 
+         #[def_test]
+-        fn sparse_resident_bytes_counts_aliases_and_clips_huge_leaves() {
++        fn sparse_residency_walk_counts_aliases_and_clips_huge_leaves() {
+             let mut table = SparseTable::<4>::try_new().unwrap();
+             let flags = PagingFlags::READ | PagingFlags::USER;
+             assert_eq!(
+@@ -1459,6 +1506,14 @@ mod tests {
+                         flags | PagingFlags::DEVICE,
+                     )
+                     .unwrap();
++                modify
++                    .map(
++                        vaddr(0xd000),
++                        paddr(0x201000),
++                        PageSize::Size4K,
++                        PagingFlags::READ,
++                    )
++                    .unwrap();
+                 modify
+                     .map(
+                         vaddr(1usize << 30),
+@@ -1475,6 +1530,24 @@ mod tests {
+                     .unwrap(),
+                 0x202000
+             );
++            let mut spans = ArrayVec::<_, 3>::new();
++            table
++                .visit_present_spans_in_range(
++                    vaddr(0),
++                    1usize << 40,
++                    flags,
++                    PagingFlags::DEVICE,
++                    |va, pa, bytes| spans.push((va, pa, bytes)),
++                )
++                .unwrap();
++            assert_eq!(
++                spans.as_slice(),
++                &[
++                    (vaddr(0x4000), paddr(0x200000), 0x1000),
++                    (vaddr(0x8000), paddr(0x200000), 0x1000),
++                    (vaddr(1usize << 30), paddr(0x400000), 0x200000),
++                ]
++            );
+             assert_eq!(
+                 table
+                     .present_bytes_in_range(
+@@ -1486,6 +1559,21 @@ mod tests {
+                     .unwrap(),
+                 0x1000
+             );
++            let clipped_start = vaddr((1usize << 30) + 0x1000);
++            spans.clear();
++            table
++                .visit_present_spans_in_range(
++                    clipped_start,
++                    0x1000,
++                    flags,
++                    PagingFlags::DEVICE,
++                    |va, pa, bytes| spans.push((va, pa, bytes)),
++                )
++                .unwrap();
++            assert_eq!(
++                spans.as_slice(),
++                &[(clipped_start, paddr(0x401000), 0x1000)]
++            );
+             assert!(matches!(
+                 table.present_bytes_in_range(vaddr(1), 0x1000, flags, PagingFlags::empty()),
+                 Err(PtError::NotAligned)
+diff --git a/mm/memspace/src/pss.rs b/mm/memspace/src/pss.rs
+new file mode 100644
+index 000000000..b0e7b0ebb
+--- /dev/null
++++ b/mm/memspace/src/pss.rs
+@@ -0,0 +1,318 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
++// See LICENSES for license details.
++
++//! On-demand proportional resident memory accounting.
++
++use alloc::{string::String, vec::Vec};
++use core::ops::Range;
++
++use kerrno::{KError, KResult};
++use khal::paging::MappingFlags;
++use memaddr::{PAGE_SIZE_4K, PhysAddr, VirtAddr};
++
++use crate::{FileMappingInfo, VmArea, lifetime::with_frozen_user_address_spaces};
++
++// Preserve fractional bytes through division and sum before rounding to KiB.
++const PSS_SHIFT: u32 = 12;
++
++/// Per-mapping resident memory and its proportional share.
++pub struct ResidentPssArea {
++    /// Mapping metadata captured with the statistics, without a backing owner.
++    pub vma: VmArea,
++    /// Resident RAM bytes in this mapping, including aliases.
++    pub resident_bytes: usize,
++    /// Proportional resident RAM, rounded down to KiB after summation.
++    pub pss_kib: u64,
++}
++
++/// Resident memory statistics for one user address space at a common cut.
++pub struct ResidentPssSnapshot {
++    /// User mappings in virtual address order, including those without resident RAM.
++    pub areas: Vec<ResidentPssArea>,
++    /// Resident RAM bytes before sharing is taken into account.
++    pub resident_bytes: usize,
++    /// Proportional resident RAM in KiB, rounded once across the address space.
++    pub pss_kib: u64,
++}
++
++#[derive(Clone, Copy)]
++struct PhysicalSpan {
++    first_pfn: usize,
++    end_pfn: usize,
++}
++
++fn collect_spans(
++    spans: &mut Vec<PhysicalSpan>,
++    enumerate: impl FnOnce(&mut dyn FnMut(VirtAddr, PhysAddr, usize)) -> KResult<()>,
++) -> KResult<()> {
++    let start_index = spans.len();
++    let mut copied = Ok(());
++    enumerate(&mut |_, physical, bytes| {
++        if copied.is_ok() {
++            copied = append_span(spans, start_index, physical, bytes);
++        }
++    })?;
++    copied
++}
++
++fn append_span(
++    spans: &mut Vec<PhysicalSpan>,
++    start_index: usize,
++    physical: PhysAddr,
++    bytes: usize,
++) -> KResult<()> {
++    let start = physical.as_usize();
++    if bytes == 0 || !start.is_multiple_of(PAGE_SIZE_4K) || !bytes.is_multiple_of(PAGE_SIZE_4K) {
++        return Err(KError::BadAddress);
++    }
++    let first_pfn = start / PAGE_SIZE_4K;
++    let end_pfn = start.checked_add(bytes).ok_or(KError::BadAddress)? / PAGE_SIZE_4K;
++    // Adjacent physical intervals may be merged within the same walk. Do not
++    // merge aliases or cross boundaries recorded for the target VMAs.
++    if spans.len() > start_index
++        && let Some(previous) = spans.last_mut()
++        && previous.end_pfn == first_pfn
++    {
++        previous.end_pfn = end_pfn;
++        return Ok(());
++    }
++    spans.try_reserve(1).map_err(|_| KError::NoMemory)?;
++    spans.push(PhysicalSpan { first_pfn, end_pfn });
++    Ok(())
++}
++
++struct ShareBoundary {
++    pfn: usize,
++    mapped_pages_before: usize,
++    fixed_bytes_before: u128,
++    fixed_bytes_per_page: u128,
++}
++
++impl ShareBoundary {
++    fn totals_at(&self, pfn: usize) -> (usize, u128) {
++        let pages = pfn - self.pfn;
++        (
++            self.mapped_pages_before
++                + if self.fixed_bytes_per_page != 0 {
++                    pages
++                } else {
++                    0
++                },
++            self.fixed_bytes_before + (pages as u128) * self.fixed_bytes_per_page,
++        )
++    }
++}
++
++struct ShareIndex(Vec<ShareBoundary>);
++
++impl ShareIndex {
++    fn new(spans: &[PhysicalSpan]) -> KResult<Self> {
++        let mut edges = Vec::new();
++        let capacity = spans.len().checked_mul(2).ok_or(KError::NoMemory)?;
++        edges
++            .try_reserve_exact(capacity)
++            .map_err(|_| KError::NoMemory)?;
++        for span in spans {
++            edges.push((span.first_pfn, 1i64));
++            edges.push((span.end_pfn, -1i64));
++        }
++        edges.sort_unstable_by_key(|&(pfn, _)| pfn);
++        let mut boundaries: Vec<ShareBoundary> = Vec::new();
++        let mut mapcount = 0i64;
++        let mut rest = edges.as_slice();
++        while let Some(&(pfn, _)) = rest.first() {
++            let batch = rest.partition_point(|&(next, _)| next == pfn);
++            let change: i64 = rest[..batch].iter().map(|&(_, delta)| delta).sum();
++            rest = &rest[batch..];
++            if change == 0 {
++                continue;
++            }
++            mapcount = mapcount.checked_add(change).ok_or(KError::BadAddress)?;
++            if mapcount < 0 {
++                return Err(KError::BadAddress);
++            }
++            let (mapped_pages_before, fixed_bytes_before) = boundaries
++                .last()
++                .map_or((0, 0), |boundary| boundary.totals_at(pfn));
++            let fixed_bytes_per_page = if mapcount == 0 {
++                0
++            } else {
++                // A zero share would lose the distinction between a hole
++                // and a mapped PFN. Reject counts beyond fixed-point precision.
++                let share = ((PAGE_SIZE_4K as u128) << PSS_SHIFT) / mapcount as u128;
++                if share == 0 {
++                    return Err(KError::InvalidInput);
++                }
++                share
++            };
++            boundaries.try_reserve(1).map_err(|_| KError::NoMemory)?;
++            boundaries.push(ShareBoundary {
++                pfn,
++                mapped_pages_before,
++                fixed_bytes_before,
++                fixed_bytes_per_page,
++            });
++        }
++        if mapcount != 0 {
++            return Err(KError::BadAddress);
++        }
++        Ok(Self(boundaries))
++    }
++
++    fn totals_at(&self, pfn: usize) -> (usize, u128) {
++        let after = self.0.partition_point(|boundary| boundary.pfn <= pfn);
++        after
++            .checked_sub(1)
++            .map_or((0, 0), |i| self.0[i].totals_at(pfn))
++    }
++
++    fn share(&self, span: PhysicalSpan) -> KResult<(usize, u128)> {
++        let (start_pages, start_fixed) = self.totals_at(span.first_pfn);
++        let (end_pages, end_fixed) = self.totals_at(span.end_pfn);
++        let pages = end_pages - start_pages;
++        if pages != span.end_pfn - span.first_pfn {
++            return Err(KError::BadAddress);
++        }
++        Ok((pages * PAGE_SIZE_4K, end_fixed - start_fixed))
++    }
++}
++
++fn mapping_metadata(vma: &VmArea) -> KResult<VmArea> {
++    let file = if let Some(info) = vma.file_mapping() {
++        let path = if let Some(original) = &info.path {
++            let mut copy = String::new();
++            copy.try_reserve_exact(original.len())
++                .map_err(|_| KError::NoMemory)?;
++            copy.push_str(original);
++            Some(copy)
++        } else {
++            None
++        };
++        Some(FileMappingInfo {
++            offset: info.offset,
++            inode: info.inode,
++            path,
++        })
++    } else {
++        None
++    };
++    Ok(VmArea::new(
++        vma.start(),
++        vma.size(),
++        vma.flags(),
++        vma.max_flags(),
++        vma.backing(),
++        vma.page_offset(),
++        file,
++    ))
++}
++
++/// Captures an address space's PSS from all active user mappings.
++///
++/// Call from task context without MM or mapping-owner locks. Simultaneous
++/// aliases count separately while all tasks sharing one MM count just once.
++/// The scan only copies span identities and mapping metadata under locks.
++/// Sorting, division and output construction run after the locks are released.
++/// Physical identities are never exported or dereferenced.
++///
++/// # Errors
++///
++/// Returns `WouldBlock` on a competing mutation or contended scan, and
++/// `NoSuchProcess` when the MM is no longer registered. Incomplete captures,
++/// malformed spans and allocation errors return an error instead of a partial
++/// PSS value.
++pub fn resident_pss_snapshot(mm_id: u64) -> KResult<ResidentPssSnapshot> {
++    let (spans, metadata) = with_frozen_user_address_spaces(|spaces| {
++        let mut spans = Vec::new();
++        let mut metadata: Vec<(VmArea, Range<usize>)> = Vec::new();
++        let mut found = false;
++        for mm in spaces {
++            if mm.mm_id() != mm_id {
++                collect_spans(&mut spans, |visit| mm.visit_resident_spans(visit))?;
++                continue;
++            }
++            found = true;
++            for vma in mm
++                .vmas()
++                .filter(|vma| vma.max_flags().contains(MappingFlags::USER))
++            {
++                let begin = spans.len();
++                collect_spans(&mut spans, |visit| mm.visit_vma_resident_spans(vma, visit))?;
++                metadata.try_reserve(1).map_err(|_| KError::NoMemory)?;
++                metadata.push((mapping_metadata(vma)?, begin..spans.len()));
++            }
++        }
++        if !found {
++            return Err(KError::NoSuchProcess);
++        }
++        Ok((spans, metadata))
++    })?;
++    let mapcounts = ShareIndex::new(&spans)?;
++    let mut areas = Vec::new();
++    areas
++        .try_reserve_exact(metadata.len())
++        .map_err(|_| KError::NoMemory)?;
++    let mut resident_bytes = 0usize;
++    let mut fixed_bytes = 0u128;
++    for (vma, span_range) in metadata {
++        let mut rss = 0usize;
++        let mut pss = 0u128;
++        for &span in &spans[span_range] {
++            let (mapped, share) = mapcounts.share(span)?;
++            rss = rss.checked_add(mapped).ok_or(KError::InvalidInput)?;
++            pss += share;
++        }
++        if rss > vma.size() {
++            return Err(KError::BadAddress);
++        }
++        areas.push(ResidentPssArea {
++            vma,
++            resident_bytes: rss,
++            pss_kib: to_kib(pss)?,
++        });
++        resident_bytes = resident_bytes
++            .checked_add(rss)
++            .ok_or(KError::InvalidInput)?;
++        fixed_bytes += pss;
++    }
++    Ok(ResidentPssSnapshot {
++        areas,
++        resident_bytes,
++        pss_kib: to_kib(fixed_bytes)?,
++    })
++}
++
++fn to_kib(fixed_bytes: u128) -> KResult<u64> {
++    u64::try_from(fixed_bytes >> (PSS_SHIFT + 10)).map_err(|_| KError::InvalidInput)
++}
++
++#[cfg(unittest)]
++mod tests {
++    use unittest::def_test;
++
++    use super::*;
++
++    #[def_test]
++    fn physical_aliases_split_a_span_and_round_once() {
++        let full = PhysicalSpan {
++            first_pfn: 32,
++            end_pfn: 36,
++        };
++        let last = PhysicalSpan {
++            first_pfn: 35,
++            end_pfn: 36,
++        };
++        let index = ShareIndex::new(&[full, full, full, last]).unwrap();
++        let (rss, pss) = index.share(full).unwrap();
++        assert_eq!(rss, 16 * 1024);
++        assert_eq!(to_kib(pss).unwrap(), 4);
++        let (_, last_share) = index.share(last).unwrap();
++        assert_eq!(to_kib(last_share).unwrap(), 1);
++        let hole = PhysicalSpan {
++            first_pfn: 31,
++            end_pfn: 33,
++        };
++        assert!(index.share(hole).is_err());
++    }
++}

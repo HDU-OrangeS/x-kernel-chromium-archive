@@ -1,0 +1,228 @@
+diff --git a/fs/kvfs/docs/design.md b/fs/kvfs/docs/design.md
+index 23aea42c6..14cddbeaa 100644
+--- a/fs/kvfs/docs/design.md
++++ b/fs/kvfs/docs/design.md
+@@ -794,7 +794,9 @@ a deferred stale PTE can be rebound to the current frame before becoming writabl
+ `with_private_read_folio` provides an inode-owned complete-page borrowing
+ boundary. The invalidate read guard covers inode-size and optional ELF-prefix
+ checks, folio lookup, clean/writeback inspection and the caller's read-only PTE
+-publication. A noneligible page returns None so filemap can use a private copy.
++publication. An eligible cached file-backed page only needs one index lookup.
++A cache miss follows the original bounded readahead window and then tries the
++demand read. A noneligible page returns None so filemap can use a private copy.
+ The callback must retain the supplied owner for every installed PTE and must
+ not re-enter the same mapping or grant write permission.
+ 
+diff --git a/fs/kvfs/docs/security.md b/fs/kvfs/docs/security.md
+index 1f19eb76a..b4e71ad13 100644
+--- a/fs/kvfs/docs/security.md
++++ b/fs/kvfs/docs/security.md
+@@ -415,7 +415,11 @@ removal. Callbacks must not recursively acquire the supplied folio's lock. The
+ MM consumer must release its reference only after PTE removal and TLB flush.
+ 
+ `with_private_read_folio` checks index arithmetic and full-page containment
+-under the invalidate read lock. It does not authorize writable PTEs or promise
++under the invalidate read lock. For a cached hit, PageCache releases the
++index lock before taking the folio lock and invoking the PTE callback.
++For a miss, optional readahead and the demand read retain the invalidate guard
++and full-page bounds are checked again before borrowing.
++It does not authorize writable PTEs or promise
+ that a borrowed page remains clean or immutable after return. Folio references
+ protect physical lifetime independently of membership in the page cache.
+ 
+diff --git a/fs/kvfs/src/address_space.rs b/fs/kvfs/src/address_space.rs
+index 15b6177e1..79b5f8938 100644
+--- a/fs/kvfs/src/address_space.rs
++++ b/fs/kvfs/src/address_space.rs
+@@ -561,6 +561,17 @@ impl AddressSpace {
+         }
+ 
+         let _invalidate_guard = self.invalidate_lock.read();
++        self.readahead_fault_window_locked(file_offset, file_end)
++    }
++
++    // The caller has checked the cache kind and observed a miss. Hold the
++    // invalidate read lock throughout the window walk and any backing reads.
++    fn readahead_fault_window_locked(
++        self: &Arc<Self>,
++        file_offset: u64,
++        file_end: Option<u64>,
++    ) -> VfsResult<()> {
++        let start_index = file_offset / PAGE_SIZE_4K as u64;
+         let file_len = self.visible_len()?.min(file_end.unwrap_or(u64::MAX));
+         if file_offset >= file_len {
+             return Ok(());
+@@ -614,31 +625,52 @@ impl AddressSpace {
+     ///
+     /// The invalidate read lock and folio lock cover the current EOF check and
+     /// callback. `file_end` additionally bounds loader-created file prefixes.
++    /// A cached file-backed page needs one index lookup. On a miss this method
++    /// attempts the normal fault readahead window before the demand read.
+     /// Returns `None` for partial, dirty or writeback pages, which callers must
+     /// materialize privately. The callback must retain the owner while its PTE
+     /// exists, must not grant write access, and must not re-enter this mapping.
+     /// This does not make future file writes immutable or invalidation synchronous.
+     pub fn with_private_read_folio<R>(
+-        &self,
++        self: &Arc<Self>,
+         index: PageIndex,
+         file_end: Option<u64>,
+-        f: impl FnOnce(&Arc<Mutex<Folio>>, &mut Folio) -> VfsResult<R>,
++        mut f: impl FnMut(&Arc<Mutex<Folio>>, &Folio) -> VfsResult<R>,
+     ) -> VfsResult<Option<R>> {
+         let inode = self.inode().ok_or(VfsError::InvalidInput)?;
+-        let end = index
+-            .checked_add(1)
+-            .and_then(|index| index.checked_mul(PAGE_SIZE_4K as u64))
++        let file_offset = index
++            .checked_mul(PAGE_SIZE_4K as u64)
++            .ok_or(VfsError::InvalidInput)?;
++        let end = file_offset
++            .checked_add(PAGE_SIZE_4K as u64)
+             .ok_or(VfsError::InvalidInput)?;
+         let _invalidate_guard = self.invalidate_lock.read();
+-        if end > inode.size() || file_end.is_some_and(|limit| end > limit) {
++        let is_full_page = || end <= inode.size().min(file_end.unwrap_or(u64::MAX));
++        if !is_full_page() {
+             return Ok(None);
+         }
+-        self.with_folio_arc_or_create(index, |owner, folio| {
++        let mut borrow_clean = |owner: &Arc<Mutex<Folio>>, folio: &Folio| {
+             if folio.is_dirty() || folio.is_under_writeback() {
+                 return Ok(None);
+             }
+             f(owner, folio).map(Some)
+-        })
++        };
++        if self.page_cache.kind() == PageCacheKind::FileBacked {
++            if let Some(result) = self
++                .page_cache
++                .with_cached_folio_arc(index, &mut borrow_clean)
++            {
++                return result;
++            }
++            // The failed lookup replaces the early residency check in
++            // readahead_for_fault. Readahead failure still leaves the demand
++            // read authoritative for this fault.
++            let _ = self.readahead_fault_window_locked(file_offset, file_end);
++            if !is_full_page() {
++                return Ok(None);
++            }
++        }
++        self.with_folio_arc_or_create(index, |owner, folio| borrow_clean(owner, folio))
+     }
+ 
+     /// Prepares and dirties a cached folio for a shared write fault.
+diff --git a/mm/filemap/docs/design.md b/mm/filemap/docs/design.md
+index a9929be67..d7a72c562 100644
+--- a/mm/filemap/docs/design.md
++++ b/mm/filemap/docs/design.md
+@@ -314,8 +314,10 @@ For a full aligned 4K file page, a read/execute fault may install a read-only
+ PTE to the inode cache folio. `AddressSpace::with_private_read_folio` excludes
+ truncate/cache invalidation during EOF and clean-state checks and PTE
+ publication. Dirty/writeback folios, partial EOF/ELF-prefix pages, unaligned
+-file data and first write faults retain the private-copy path. Readahead remains
+-optional; a demand-read error is authoritative.
++file data and first write faults retain the private-copy path. Aligned complete
++file-backed pages perform a single cache lookup on a hit. Missing complete
++pages use the existing optional fault readahead window and demand fallback.
++Pages that must be copied use the private copy path's own readahead.
+ 
+ The runtime stores folio owners separately from anonymous object slots, keyed
+ by its stable object offset. A write fault allocates and copies one private
+diff --git a/mm/filemap/docs/security.md b/mm/filemap/docs/security.md
+index 456660f98..b4a5e1483 100644
+--- a/mm/filemap/docs/security.md
++++ b/mm/filemap/docs/security.md
+@@ -146,6 +146,7 @@ a failed conditional update releases only the new, unpublished frame.
+ Private pin locking nests inside MmSpace and, during initial borrowing, the
+ AddressSpace invalidate read lock and folio lock. Code clones pins and drops
+ the pin-map lock before acquiring a folio lock; it must not invert this order.
++The cache-hit path releases the cache index lock before taking the folio lock.
+ First-write copying holds a folio owner across preparation and commit. Kernel
+ cache mutations use the folio lock; writes through other shared user mappings
+ retain their existing concurrency semantics and are not serialized by it.
+diff --git a/mm/filemap/src/private.rs b/mm/filemap/src/private.rs
+index fb667d16b..7a795b82f 100644
+--- a/mm/filemap/src/private.rs
++++ b/mm/filemap/src/private.rs
+@@ -138,9 +138,8 @@ impl FilePrivateRuntime {
+         if file_offset % PAGE_SIZE_4K as u64 != 0 {
+             return Ok(false);
+         }
+-        let mapping = self.file.mapping();
+-        let _ = mapping.readahead_for_fault(file_offset, self.file_end);
+-        mapping
++        self.file
++            .mapping()
+             .with_private_read_folio(
+                 file_offset / PAGE_SIZE_4K as u64,
+                 self.file_end,
+@@ -1007,6 +1006,9 @@ mod tests {
+         let shared = first_pt.query(first.start).unwrap().0;
+         let sibling = first_pt.query(first.start + PAGE_SIZE_4K).unwrap().0;
+         assert_eq!(shared, second_pt.query(second.start).unwrap().0);
++        let backend = file.inode().private::<FaultReadBackend>().unwrap();
++        assert_eq!(backend.counts.lock().readahead, 1);
++        assert_eq!(backend.counts.lock().demand, 0);
+         assert!(
+             !first_pt
+                 .query(first.start)
+diff --git a/mm/pagecache/docs/design.md b/mm/pagecache/docs/design.md
+index ccbe9796a..ea1a96775 100644
+--- a/mm/pagecache/docs/design.md
++++ b/mm/pagecache/docs/design.md
+@@ -143,6 +143,10 @@ surviving truncated tail 被清零并重新加入 dirty index。
+ 
+ `with_folio_arc_or_create` shares the same lookup, materialization, locking and
+ dirty reconciliation as `with_folio_or_create`, but also supplies the owning Arc.
++The read-only `with_cached_folio_arc` looks up an existing owner once, releases
++the index lock, and takes the folio lock before invoking the callback. A miss
++does not materialize a page. The caller supplies any mapping-level invalidation
++guard required to connect the returned owner to its mapping.
+ A file-mapping runtime may retain it after the entry leaves the cache, until its
+ PTE and stale TLB entries no longer reference the frame. No mapping runtime owns
+ or mutates the cache index itself.
+diff --git a/mm/pagecache/docs/security.md b/mm/pagecache/docs/security.md
+index f3d11cfc3..2f48978cd 100644
+--- a/mm/pagecache/docs/security.md
++++ b/mm/pagecache/docs/security.md
+@@ -41,6 +41,10 @@ operation 放入缓存索引临界区。`writeback_until` 会在 folio lock 下
+ callback，该 callback 不得重入同一个 `PageCache`；batch writeback 则在调用 backend
+ 前释放 folio lock。
+ 
++`with_cached_folio_arc` 在索引锁下取得 owner，释放索引锁后才加 folio 锁。
++回调只借用 `&Folio`，持有的 owner 用于延长页寿命。调用方不得在回调内重入
++缓存或再次获取当前 folio 锁。映射层负责用 invalidate guard 排除截断。
++
+ ## 威胁分析
+ 
+ | 编号 | 威胁 | 控制 |
+diff --git a/mm/pagecache/src/lib.rs b/mm/pagecache/src/lib.rs
+index 03eee816b..3a78f0e77 100644
+--- a/mm/pagecache/src/lib.rs
++++ b/mm/pagecache/src/lib.rs
+@@ -232,6 +232,23 @@ impl PageCache {
+         }
+     }
+ 
++    /// Runs a read-only callback with an already present folio and its owner.
++    ///
++    /// Returns `None` on a cache miss without reading backing storage. The
++    /// index lock is released before taking the folio lock. The callback may
++    /// retain the owner but must not lock it again or reenter this cache.
++    /// Callers that need to exclude truncation must hold their mapping's
++    /// invalidate guard.
++    pub fn with_cached_folio_arc<R>(
++        &self,
++        index: PageIndex,
++        f: impl FnOnce(&Arc<Mutex<Folio>>, &Folio) -> R,
++    ) -> Option<R> {
++        let owner = self.inner.lock().pages.get(&index)?.clone();
++        let folio = owner.lock();
++        Some(f(&owner, &folio))
++    }
++
+     /// Returns the number of contiguous cached folios starting at `start`.
+     pub fn cached_run_len(&self, start: PageIndex, count: usize) -> usize {
+         if count == 0 {

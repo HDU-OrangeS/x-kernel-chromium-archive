@@ -1,0 +1,250 @@
+diff --git a/process/kprocess/docs/design.md b/process/kprocess/docs/design.md
+index bda7f8a6f..39c7eb7cc 100644
+--- a/process/kprocess/docs/design.md
++++ b/process/kprocess/docs/design.md
+@@ -82,6 +82,8 @@ retains init identity; orphan reparenting reserves an init relation slot.
+   thread's pointers; `ptrace` checks cross-task read credentials.
+ - `timer_delivery` registers `ktimer` expiry and `ksignal` dequeue observers;
+   CPU timers run on current-user-thread return and wall timers on the alarm task.
++  The CPU poll checks for an armed CPU deadline under the timer mutex before
++  sampling the thread group. It returns immediately when no such deadline exists.
+   `UserTaskRuntime for Thread` supplies CPU residency and AArch64 switch roots to
+   `ktask`; `CurrentSignalDispatch` adapts current-task signal injection.
+ - `TaskStat`, `system_view`, nice/scheduler and CPU-accounting APIs provide
+@@ -196,8 +198,10 @@ membership or sleepable locks. This avoids double counting or dropping a thread
+ at the live/exited handoff without allocating in scheduler callbacks. Group
+ sampling retains an Arc vector until after releasing the membership lock, so
+ a concurrent publication rollback cannot trigger the final task destructor
+-under that lock. As before, group sampling allocates this task snapshot. Thread credential commit takes objective
+-then subjective credential write locks and asserts the pointers were not
++under that lock. Group sampling allocates this task snapshot. An active CPU
++timer poll releases the timer mutex before sampling and reacquires it to check
++the latest deadlines. Thread credential commit takes objective then subjective
++credential write locks and asserts the pointers were not
+ independently overridden. CPU totals use relaxed nanosecond atomics and are
+ observational counters, not publication barriers. Heap and thread control fields
+ use their documented atomic orderings; no single atomic read proves an entire
+diff --git a/process/kprocess/docs/security.md b/process/kprocess/docs/security.md
+index e35dd7c80..e28e0bc48 100644
+--- a/process/kprocess/docs/security.md
++++ b/process/kprocess/docs/security.md
+@@ -91,6 +91,13 @@ lock (membership → CPU lock), which excludes the prior missing/double-count
+ window. Aggregate backing counters remain relaxed atomics; the membership lock
+ orders the production exited-thread transfer.
+ Their snapshots are not transactionally tied to every directory/resource field.
++
++The user-return timer poll only skips group sampling after checking the current
++deadlines under the timer mutex. The mutex is released before taking the
++membership lock. A concurrent arm or disarm is serialized by the timer mutex.
++The arm path applies the current CPU total and subsequent polls check the new
++deadline.
++
+ `ExecMetadata` atomically replaces its pair, while separate getters can straddle
+ updates. Timer signal dequeue callbacks validate timer sequence through ktimer;
+ missing targets are ignored by delivery glue rather than reviving retired tasks.
+diff --git a/process/kprocess/src/process/runtime_access.rs b/process/kprocess/src/process/runtime_access.rs
+index 732961897..db60f93d8 100644
+--- a/process/kprocess/src/process/runtime_access.rs
++++ b/process/kprocess/src/process/runtime_access.rs
+@@ -506,14 +506,22 @@ impl Process {
+     }
+ 
+     /// Polls CPU-driven timers while runtime remains attached.
++    ///
++    /// Returns `KError::NoSuchProcess` after the process runtime is gone.
+     pub(crate) fn poll_cpu_timers(&self) -> KResult<Vec<TimerDelivery>> {
++        let runtime = self.runtime()?;
++        let timer_manager = runtime.timer_manager();
++        if !timer_manager.lock().has_armed_cpu_timers() {
++            return Ok(Vec::new());
++        }
++
++        // Release the timer mutex before taking the membership lock. Poll the
++        // latest timer state after sampling in case it changed in between.
+         let (process_utime, process_stime) = self.process_cpu_times();
+-        self.runtime().map(|runtime| {
+-            runtime
+-                .timer_manager()
+-                .lock()
+-                .poll_cpu_timers(process_utime, process_stime)
+-        })
++        let deliveries = timer_manager
++            .lock()
++            .poll_cpu_timers(process_utime, process_stime);
++        Ok(deliveries)
+     }
+ 
+     /// Updates POSIX timer signal accounting when a timer signal is dequeued.
+diff --git a/process/ktimer/docs/design.md b/process/ktimer/docs/design.md
+index 271b2c02e..44f2fbe1c 100644
+--- a/process/ktimer/docs/design.md
++++ b/process/ktimer/docs/design.md
+@@ -53,7 +53,10 @@ notification and overrun state.
+   syscall and user-return paths; they do not sleep.
+ - `poll_cpu_timers` relies on caller-supplied sampled `TimeSpan` user and
+   kernel CPU totals of the same process; CPU timers are pure polling, no
+-  interrupts.
++  interrupts. The caller checks `has_armed_cpu_timers` under the timer mutex
++  before collecting those totals. Legacy virtual and profiling timers and
++  POSIX process CPU timers are armed when they have a deadline. The POSIX
++  deadline must advance on expiration even with `SIGEV_NONE`.
+ - The alarm task (`spawn_alarm_task`) is a sleepable kernel task using
+   `timeout_at` on the earliest `MonotonicInstant`; the expired-owner
+   callback re-enters `kprocess` polling and may therefore block on the
+diff --git a/process/ktimer/docs/security.md b/process/ktimer/docs/security.md
+index b060dc593..752597bb1 100644
+--- a/process/ktimer/docs/security.md
++++ b/process/ktimer/docs/security.md
+@@ -56,6 +56,9 @@ There is no FFI or inline assembly; architecture time reads come through
+ ## Thread safety
+ 
+ Per-process state is serialized externally by the process runtime mutex.
++The armed CPU timer check reads the actual deadlines under the same mutex as
++arm, disarm, delete and expiry. An active poll uses the current state after
++the caller has sampled CPU time and reacquired the mutex.
+ The alarm heap is `ksync::Mutex`-protected with short critical sections;
+ `Event` notifications follow `event-listener`'s memory model. The expired
+ handler is a `fn` pointer published once.
+diff --git a/process/ktimer/src/manager.rs b/process/ktimer/src/manager.rs
+index a012a053c..6da1c0a42 100644
+--- a/process/ktimer/src/manager.rs
++++ b/process/ktimer/src/manager.rs
+@@ -111,6 +111,20 @@ impl ProcessTimerManager {
+         deliveries
+     }
+ 
++    /// Returns whether any CPU-driven timer has a pending deadline.
++    ///
++    /// The owning runtime uses this under its timer mutex before sampling
++    /// thread-group CPU time. Notification-free POSIX timers also advance
++    /// their deadlines when polled, so their notification mode is immaterial.
++    pub fn has_armed_cpu_timers(&self) -> bool {
++        self.itimers[ITIMER_VIRTUAL_INDEX].deadline().is_some()
++            || self.itimers[ITIMER_PROF_INDEX].deadline().is_some()
++            || self
++                .posix_timers
++                .values()
++                .any(PosixTimer::is_armed_process_cpu)
++    }
++
+     /// Polls the CPU-based interval timers against aggregated process CPU time.
+     pub fn poll_cpu_timers(
+         &mut self,
+@@ -361,13 +375,14 @@ impl ProcessTimerManager {
+ 
+ #[cfg(unittest)]
+ mod tests {
++    use khal::time::monotonic_time;
+     use ksignal::Signo;
+     use ktime_types::TimeSpan;
+-    use linux_raw_sys::general::CLOCK_PROCESS_CPUTIME_ID;
++    use linux_raw_sys::general::{CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID};
+     use posix_types::ITimerType;
+     use unittest::def_test;
+ 
+-    use super::ProcessTimerManager;
++    use super::{ITIMER_REAL_INDEX, ProcessTimerManager, TimerInstant};
+     use crate::{
+         TimerDelivery, TimerSignal,
+         posix_timer::{PosixTimerCreateNotify, PosixTimerSigValue},
+@@ -403,6 +418,85 @@ mod tests {
+         assert_eq!(remained.subsec_nanos(), 44);
+     }
+ 
++    #[def_test]
++    fn cpu_poll_ignores_armed_wall_clock_timers() {
++        let mut manager = ProcessTimerManager::new(1);
++        let now = TimerInstant::Monotonic(monotonic_time());
++        let delay = TimeSpan::from_secs(1);
++
++        // Populate the wall deadlines without adding entries to the global alarm queue.
++        manager.itimers[ITIMER_REAL_INDEX].set(now, TimeSpan::ZERO, now.checked_add(delay));
++        let wall_id = manager
++            .create_posix_timer(CLOCK_MONOTONIC as i32, PosixTimerCreateNotify::None)
++            .unwrap();
++        manager
++            .posix_timers
++            .get_mut(&wall_id)
++            .unwrap()
++            .settime(false, TimeSpan::ZERO, delay, TimeSpan::ZERO, TimeSpan::ZERO)
++            .unwrap();
++        assert!(!manager.has_armed_cpu_timers());
++
++        let zero = TimeSpan::ZERO;
++        for (kind, signo, utime, stime) in [
++            (ITimerType::Virtual, Signo::SIGVTALRM, delay, zero),
++            (ITimerType::Prof, Signo::SIGPROF, zero, delay),
++        ] {
++            manager.set_itimer(kind, zero, delay, zero, zero);
++            assert!(manager.has_armed_cpu_timers());
++            let deliveries = manager.poll_cpu_timers(utime, stime);
++            assert!(matches!(
++                deliveries.as_slice(),
++                [TimerDelivery::Process(TimerSignal::Legacy { signo: observed })] if *observed == signo
++            ));
++            assert!(!manager.has_armed_cpu_timers());
++        }
++    }
++
++    #[def_test]
++    fn cpu_poll_tracks_live_posix_deadlines_without_signal_notification() {
++        let mut manager = ProcessTimerManager::new(1);
++        let timer_id = manager
++            .create_posix_timer(
++                CLOCK_PROCESS_CPUTIME_ID as i32,
++                PosixTimerCreateNotify::None,
++            )
++            .unwrap();
++        assert!(!manager.has_armed_cpu_timers());
++
++        let zero = TimeSpan::ZERO;
++        let tick = TimeSpan::from_nanos(1);
++        let (_, delivery) = manager
++            .set_posix_timer(timer_id, false, zero, tick, zero, zero)
++            .unwrap();
++        assert!(delivery.is_none());
++        assert!(manager.has_armed_cpu_timers());
++        assert!(manager.poll_cpu_timers(tick, zero).is_empty());
++        assert!(!manager.has_armed_cpu_timers());
++
++        manager
++            .set_posix_timer(timer_id, false, tick, tick, tick, zero)
++            .unwrap();
++        let expiry = tick.saturating_add(tick);
++        assert!(manager.poll_cpu_timers(expiry, zero).is_empty());
++        assert!(manager.has_armed_cpu_timers());
++        assert_eq!(
++            manager.get_posix_timer(timer_id, expiry, zero),
++            Ok((tick, tick))
++        );
++        manager
++            .set_posix_timer(timer_id, false, zero, zero, expiry, zero)
++            .unwrap();
++        assert!(!manager.has_armed_cpu_timers());
++
++        manager
++            .set_posix_timer(timer_id, false, zero, tick, expiry, zero)
++            .unwrap();
++        assert!(manager.has_armed_cpu_timers());
++        manager.delete_posix_timer(timer_id).unwrap();
++        assert!(!manager.has_armed_cpu_timers());
++    }
++
+     #[def_test]
+     fn test_posix_timer_signal_seq_invalidates_stale_signal() {
+         let mut manager = ProcessTimerManager::new(1);
+diff --git a/process/ktimer/src/posix_timer.rs b/process/ktimer/src/posix_timer.rs
+index 39fb134b8..92a100532 100644
+--- a/process/ktimer/src/posix_timer.rs
++++ b/process/ktimer/src/posix_timer.rs
+@@ -252,6 +252,10 @@ impl PosixTimer {
+         self.clock == PosixTimerClock::ProcessCpu
+     }
+ 
++    pub(crate) fn is_armed_process_cpu(&self) -> bool {
++        self.is_process_cpu() && self.spec.deadline().is_some()
++    }
++
+     pub(crate) fn arm_deadline(&mut self, owner_pid: Pid) {
+         let runtime_deadline = self
+             .spec

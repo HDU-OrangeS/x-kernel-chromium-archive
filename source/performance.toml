@@ -1,0 +1,33 @@
+format-version = 6
+package = "entry"
+guest-ip = "10.0.2.15"
+gateway = "10.0.2.2"
+unittest = false
+build-id = "37c6a6f1aebb6d95d6ec55ff4408e57124928ed7b9e13d594b4522b1736f7401"
+
+[build-info]
+arch = "aarch64"
+platform = "kplat-aarch64"
+target = "aarch64-unknown-none-softfloat"
+build-mode = "release"
+build-machine = "cuizh@cuizh-VGHH-XX"
+default-log-level = "warn"
+backtrace = false
+nr-cpus-max = 4
+vmm-enabled = false
+config-sha256 = "d33734dc97466eff661fa48bc6099a0ac890723fcb666646121bc76c156854c9"
+git-commit = "799107c7d5b5db18276132af48ad76cc0fc3c30f"
+git-dirty = "true"
+build-time = "2026-11-23T02:55:39.133499072Z"
+
+[kernel-elf]
+path = "kernel.elf"
+size = 226507552
+
+[kernel-debug-elf]
+path = "kernel.debug.elf"
+size = 226507552
+
+[kernel-image]
+path = "kernel.bin"
+size = 8406528

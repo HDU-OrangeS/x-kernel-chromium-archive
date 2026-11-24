@@ -1,0 +1,184 @@
+diff --git a/fs/kvfs/docs/design.md b/fs/kvfs/docs/design.md
+index 14cddbeaa..9a4e0022b 100644
+--- a/fs/kvfs/docs/design.md
++++ b/fs/kvfs/docs/design.md
+@@ -584,7 +584,10 @@ Buffered read 只在当前待复制的页未缓存时发起预读，窗口仍按
+ 
+ `AddressSpace::readahead_for_fault()` 为私有文件缺页提供独立的同步预读入口。它只处理
+ FileBacked 缓存中尚未存在的目标页，在 invalidate shared lock 内读取 inode 大小，
+-从目标页开始选择最多 16 页，并受真实 EOF 和可选 ELF 文件前缀末端限制。在这个有界
++从目标页开始选取窗口：目标为第 0 页，或紧邻前一页已经缓存时，最多选择 16 页；
++其他非零位置的孤立缺页最多选择 4 页，减少稀疏访问预取后长期保留的相邻页。
++前一页驻留只是顺序访问提示，不记录进程级访问历史；4 页窗口后的相邻缺页可以恢复
++16 页窗口。两种窗口都受真实 EOF 和可选 ELF 文件前缀末端限制。在这个有界
+ 窗口内，已缓存页被跳过，只有连续缺页区间交给后端。缓存索引锁仅用于检查，不跨 I/O。
+ 窗口末端向上取整到页：ELF 前缀在页中间结束时，该缓存页仍保留完整的文件内容，BSS
+ 由 filemap 的私有 frame 补零。此 helper 不安装 PTE，也不掌握当前 VMA 边界，因此
+diff --git a/fs/kvfs/docs/security.md b/fs/kvfs/docs/security.md
+index b4e71ad13..374164535 100644
+--- a/fs/kvfs/docs/security.md
++++ b/fs/kvfs/docs/security.md
+@@ -211,8 +211,10 @@ page-cache 锁到预读回调，也不改变原有 truncate/write 的并发契
+ 
+ 私有缺页预读在 invalidate shared lock 内选取窗口并完成后端读取/缓存插入，排除
+ truncate 在此期间改变 EOF 后再插入过时页；返回后实际需求读取仍保留原有并发契约。
+-缓存检查不持锁跨后端调用，竞态下已有 folio 优先，不能覆盖后来插入的脏页。最多
+-16 页限制单次工作量，不是全局缓存预算；稀疏访问可能读取不会使用的相邻页，且当前
++缓存检查不持锁跨后端调用，竞态下已有 folio 优先，不能覆盖后来插入的脏页。
++第 0 页及前一页已缓存时选用最多 16 页，否则孤立非零缺页最多 4 页。前一页驻留
++仅影响预取工作量，不保证后续驻留，不改变实际需求读取和缓存页所有权。两种窗口
++都只限制单次工作量，不是全局缓存预算；稀疏访问仍可能读取不会使用的相邻页，且当前
+ 没有由此引入 reclaim 策略。ELF `file_end` 只限制选页，不授权清空共享缓存尾部。
+ helper 可能在 MmSpace 锁内阻塞；truncate 的 notifier 通过 `InvalidateHandle::submit`
+ 非阻塞尝试 MmSpace 锁，否则排队，不能改成持 invalidate 锁等待 MmSpace。
+diff --git a/fs/kvfs/src/address_space.rs b/fs/kvfs/src/address_space.rs
+index 562ec9c2d..2763675b7 100644
+--- a/fs/kvfs/src/address_space.rs
++++ b/fs/kvfs/src/address_space.rs
+@@ -30,6 +30,7 @@ use crate::{Kiocb, Mutex, NodeFlags, NodeType, RwLock, VfsError, VfsResult, Weak
+ 
+ const MAX_READAHEAD_BYTES: usize = 128 * 1024;
+ const MAX_FAULT_READAHEAD_PAGES: usize = 16;
++const ISOLATED_FAULT_READAHEAD_PAGES: usize = 4;
+ static NEXT_ADDRESS_SPACE_ID: AtomicU64 = AtomicU64::new(1);
+ 
+ struct AddressSpaceViewRegistration {
+@@ -530,8 +531,10 @@ impl AddressSpace {
+     /// Prefetches missing file-cache pages near a private mapping's read fault.
+     ///
+     /// A cached target or an in-memory mapping requires no work. Otherwise at
+-    /// most 16 pages, starting at the page containing `file_offset`, are selected
+-    /// below both the current inode size and the optional exclusive `file_end`.
++    /// most 16 pages are selected at page zero or when the preceding page is
++    /// cached, a hint for sequential access. An isolated nonzero miss selects
++    /// at most 4 pages. Both windows start at the page containing `file_offset`
++    /// and stay below the inode size and the optional exclusive `file_end`.
+     /// The last selected page retains its full backing-file contents: an ELF
+     /// zero-fill tail belongs in the caller's private frame, not in this cache.
+     /// Only absent runs are passed to the backing readahead operation. This
+@@ -576,8 +579,17 @@ impl AddressSpace {
+         if file_offset >= file_len {
+             return Ok(());
+         }
++        // Retain batching for initial and sequential faults without keeping
++        // a full window for every isolated offset. Residency is only a hint:
++        // the normal missing-run walk and demand read remain authoritative.
++        let window_pages =
++            if start_index == 0 || self.page_cache.cached_run_len(start_index - 1, 1) != 0 {
++                MAX_FAULT_READAHEAD_PAGES
++            } else {
++                ISOLATED_FAULT_READAHEAD_PAGES
++            };
+         let end_index = start_index
+-            .checked_add(MAX_FAULT_READAHEAD_PAGES as u64)
++            .checked_add(window_pages as u64)
+             .ok_or(VfsError::InvalidInput)?
+             .min(file_len.div_ceil(PAGE_SIZE_4K as u64));
+         let mut index = start_index;
+@@ -1452,6 +1464,52 @@ mod tests {
+         );
+     }
+ 
++    #[def_test]
++    fn fault_readahead_expands_after_an_isolated_window() {
++        let inode = read_test_inode(64 * PAGE_SIZE_4K, false, NodeFlags::empty());
++        let mapping = inode.address_space();
++        let backend = inode.private::<BufferedReadBackend>().unwrap();
++        mapping
++            .readahead_for_fault((32 * PAGE_SIZE_4K + 17) as u64, None)
++            .expect("prefetch isolated nonzero window");
++        assert_eq!(mapping.nrpages(), 4);
++        assert_eq!(
++            *backend.reads.lock(),
++            vec![((32 * PAGE_SIZE_4K) as u64, 4 * PAGE_SIZE_4K)]
++        );
++        for index in [31, 36] {
++            mapping.with_folio(index, |folio| assert!(folio.is_none()));
++        }
++
++        mapping
++            .readahead_for_fault((36 * PAGE_SIZE_4K) as u64, None)
++            .expect("cached predecessor permits a full continuation window");
++        assert_eq!(mapping.nrpages(), 20);
++        assert_eq!(
++            *backend.reads.lock(),
++            vec![
++                ((32 * PAGE_SIZE_4K) as u64, 4 * PAGE_SIZE_4K),
++                ((36 * PAGE_SIZE_4K) as u64, 16 * PAGE_SIZE_4K),
++            ]
++        );
++        for index in 32..52 {
++            mapping.with_folio(index, |folio| {
++                assert!(
++                    folio
++                        .unwrap()
++                        .data()
++                        .iter()
++                        .enumerate()
++                        .all(|(offset, byte)| {
++                            *byte == backing_byte(index as usize * PAGE_SIZE_4K + offset)
++                        })
++                );
++            });
++        }
++        mapping.with_folio(52, |folio| assert!(folio.is_none()));
++        mapping.truncate_final().expect("discard test-owned pages");
++    }
++
+     #[def_test]
+     fn fault_readahead_reads_missing_runs_without_overwriting_dirty_pages() {
+         let inode = read_test_inode(16 * PAGE_SIZE_4K, false, NodeFlags::empty());
+diff --git a/mm/kalloc/docs/design.md b/mm/kalloc/docs/design.md
+index 6c359b6e3..f1f4fe7d7 100644
+--- a/mm/kalloc/docs/design.md
++++ b/mm/kalloc/docs/design.md
+@@ -157,9 +157,12 @@ metadata mutation 仍由对应锁串行化。初始化调用本身依赖启动
+ 4. 中央 byte allocator 无法满足请求时，从 `palloc` 取得新 region，加入 byte heap
+    后重试。
+ 
+-byte heap 首次建立至少使用 32 KiB。后续增长请求参考当前 heap 总量和本次 layout，
+-取 power-of-two 大小；page allocation 失败时逐步减半，直到一页或能够容纳 layout 的
+-最小 region。byte heap 已取得的 backing region 不主动归还 page allocator。
++byte heap 首次建立至少使用 32 KiB。小堆按现有容量增长；容量达到 8 MiB 后，
++常规增长请求从 8 MiB 起步，避免一次分配失败就把大量页永久转入 byte heap。
++容量达到 256 MiB 后恢复较大的增长步长，限制大堆消耗的 region 描述符数。
++对齐量大于 8 MiB 的请求沿用原步长。增长容量需要容纳本次 layout 并向上取二次幂。page
++allocation 失败时逐步减半，直到一页或能够容纳 layout 的最小 region。byte heap
++已取得的 backing region 不主动归还 page allocator。
+ 
+ deallocation 必须携带原 allocation 的 pointer 和 layout。超过 1 MiB 的大对象返回 page
+ allocator；slab-cache-eligible 对象优先进入当前 CPU cache；其他对象返回中央 byte
+diff --git a/mm/kalloc/src/lib.rs b/mm/kalloc/src/lib.rs
+index b3c4782ab..127bc4940 100644
+--- a/mm/kalloc/src/lib.rs
++++ b/mm/kalloc/src/lib.rs
+@@ -29,6 +29,9 @@ use memaddr::PAGE_SIZE_4K;
+ use strum::{IntoStaticStr, VariantArray};
+ const MIN_HEAP_SIZE: usize = 0x8000; // 32 K
+ 
++const HEAP_GROWTH_STEP_BYTES: usize = 8 * 1024 * 1024;
++const HEAP_GEOMETRIC_GROWTH_RESUME_BYTES: usize = 256 * 1024 * 1024;
++
+ /// Keep medium-sized buffers in the byte heap so they can reuse memory already
+ /// transferred from the page allocator instead of requiring a new high-order block.
+ const LARGE_ALLOC_THRESHOLD_BYTES: usize = 1024 * 1024;
+@@ -423,7 +426,18 @@ impl GlobalAllocator {
+     ) -> AllocResult {
+         let heap_ready = self.heap_ready.load(Ordering::Acquire);
+         let old_size = if heap_ready { balloc.total_bytes() } else { 0 };
+-        let exp_size = old_size
++        // Backing assigned to the byte heap stays there, so a medium-sized
++        // heap should not reserve its entire current size on a single miss.
++        // Resume larger growth steps for very large heaps to conserve the
++        // slab buddy's region descriptors.
++        let growth_bytes = if old_size < HEAP_GEOMETRIC_GROWTH_RESUME_BYTES
++            && layout.align() <= HEAP_GROWTH_STEP_BYTES
++        {
++            old_size.min(HEAP_GROWTH_STEP_BYTES)
++        } else {
++            old_size
++        };
++        let exp_size = growth_bytes
+             .max(layout.size())
+             .next_power_of_two()
+             .max(PAGE_SIZE_4K);

@@ -1,0 +1,8 @@
+{
+  "release": "archive-2026-11-24",
+  "asset": "rootfs.img.xz",
+  "archive_sha256": "8ffae5bea546e686d3c6cbad567928e4a6cc044f57b16ec4e23c1f4cac31cec4",
+  "archive_bytes": 369038216,
+  "disk_sha256": "261c38520e961f8bf3c8753739ab6094f3c37d86e94e002aa64c4493da459336",
+  "disk_bytes": 2147483648
+}

@@ -1,0 +1,21 @@
+diff --git a/fs/kvfs/src/address_space.rs b/fs/kvfs/src/address_space.rs
+index 79b5f8938..562ec9c2d 100644
+--- a/fs/kvfs/src/address_space.rs
++++ b/fs/kvfs/src/address_space.rs
+@@ -1510,7 +1510,15 @@ mod tests {
+             })
+             .unwrap()
+             .unwrap();
+-        assert_eq!(mapping.nrpages(), 1);
++        // A full-page demand fault also prefetches the backing EOF tail.
++        // The partial folio stays in the cache and must never be borrowed.
++        assert_eq!(mapping.nrpages(), 2);
++        assert_eq!(
++            mapping.with_private_read_folio(1, None, |_, _| {
++                panic!("a prefetched partial EOF must not publish a shared PTE")
++            }),
++            Ok(None::<()>)
++        );
+         borrowed.lock().mark_dirty();
+         assert_eq!(
+             mapping.with_private_read_folio(0, None, |_, _| {
