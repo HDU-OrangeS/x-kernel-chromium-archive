@@ -1,0 +1,606 @@
+diff --git a/docs/experiments/virgl/README.md b/docs/experiments/virgl/README.md
+index 525d50a06..5561b1f56 100644
+--- a/docs/experiments/virgl/README.md
++++ b/docs/experiments/virgl/README.md
+@@ -1,5 +1,15 @@
+ # VirtIO GPU / VirGL 接入
+ 
++当前已验证的 3D 基线是 `1a373a785`：原生 fence、Chromium WebGL1、Weston GL、
++GTK 输入与窗口缩放、正常退出及 2D 回退均有记录。完整结果见
++[持久化开发桌面](README-development.md)。本页下方旧黑屏和旧同步限制为历史调查，
++不能据此判断当前基线仍未修复。
++
++Xonotic 拓展及本轮修复另见 [游戏与完整 3D 链路](../xonotic/README.md)，其中包含
++渲染/合成、输入和资源生命周期图，以及候选修改的实际验收状态。
++
++## 历史接入与排查记录
++
+ 本目录保存决赛 3D 加速的实现和诊断入口。AArch64 客体已通过原装 Mesa 25.1.9
+ 的 EGL / GLES2 着色器绘制与像素读回，`GL_RENDERER=virgl`。`renderD128`、
+ per-open GEM、mmap、virtgpu ioctl 与延迟回收已接通。Weston 14.0.2 已使用
+diff --git a/io/drmdevice/docs/design.md b/io/drmdevice/docs/design.md
+index 25e1cc474..04aa679c1 100644
+--- a/io/drmdevice/docs/design.md
++++ b/io/drmdevice/docs/design.md
+@@ -97,8 +97,8 @@ not supported. The boot-lifetime worker owns the eventual blocking work.
+ ## Namespaces and owned mappings
+ 
+ The render table is per open file description: dup, fork and SCM_RIGHTS share it;
+-independent opens have separate contexts and tables. Its 1024 slots use bit 31 as
+-a render tag, bits 10–30 as a nonwrapping generation and bits 0–9 as the slot.
++independent opens have separate contexts and tables. Its 4096 slots use bit 31 as
++a render tag, bits 12–30 as a nonwrapping generation and bits 0–11 as the slot.
+ A reserved slot is not readable/removable. Lookup clones an Arc under the short
+ spinlock; close removes the entry under that lock and drops the owner afterwards.
+ A generation-exhausted slot is permanently unavailable.
+@@ -126,13 +126,19 @@ legacy dumb aliases are cached/private. Mmap tokens are never bus/CPU addresses.
+ 
+ Creation reserves a handle slot and mmap extent, then resource/backing retirement
+ slots before DMA or host publication. Coherent backing is fully zeroed, including
+-the rounded tail. `BufferBacking` is limited to 64 MiB per allocation and 256 MiB
++the rounded tail. `BufferBacking` is limited to 64 MiB per allocation and 512 MiB
+ total charged memory, including pending and quarantined owners. This budget does
+ not cover the old global dumb buffers or QEMU/host renderer allocations.
+ 
+ A context uses one retirement slot; each resource uses a GPU job and backing job;
+-a primary open also reserves one KMS-cleanup job. The shared queue has 2048 slots,
+-so queue capacity may limit resource creation before a handle table fills.
++a primary open also reserves one KMS-cleanup job. The shared queue has 16384 heap-allocated slots. This accommodates the portable
++service's 4096-resource bound with separate backing/GPU jobs and headroom for
++imports, contexts and KMS files. It is still a shared cap: retained mappings,
++imports or quarantines may exhaust it before a file-local handle table fills.
++The former 2048 slots and 256-MiB backing cap independently prevented Xonotic
++map loading. These larger ceilings are capacity policy, not preallocated DMA
++memory or a throughput claim. Slot reservation/claim and handle mapping lookup
++retain their bounded linear scans; sustained large-scene performance is unmeasured.
+ A possibly partial kdma allocation failure retains its budget charge and stops
+ further render allocations. A failed user copyout revokes a newly published GEM
+ handle; concurrent holders already cloned from it remain safe owners.
+diff --git a/io/drmdevice/docs/security.md b/io/drmdevice/docs/security.md
+index d948484cc..768d41f39 100644
+--- a/io/drmdevice/docs/security.md
++++ b/io/drmdevice/docs/security.md
+@@ -100,7 +100,7 @@ or CPU access has ended; that proof belongs to its concrete payload and pins.
+   Confirmed disable then RMFB releases those references and permits destroy;
+   old CPU mappings retain their independent page owner. Software-only disable
+   must not be used to bypass this order.
+-  The 256 MiB render budget does not constrain this older table.
++  The 512 MiB render budget does not constrain this older table.
+ 
+ ## Thread safety and execution context
+ 
+@@ -158,7 +158,7 @@ payload drops are outside the queue lock and may enqueue another job safely.
+ | T-03 | High: cross-file render/KMS use | Foreign handle/FB or owner takeover | File-local tagged handles, FB owner checks and serialized owner acquisition. Existing dumb/blob/auth state is not equivalently isolated. |
+ | T-04 | High: stale FD rollback closes another file | Export copyout fails while descriptor activity continues | Hidden reserved marker and Arc identity; rollback cancels its own marker only. Attachments are checked before install. |
+ | T-05 | High: false completion frees live backing | Timeout, malformed response, failed disable/detach/unref or DMA release | Preserve owners and budget; quarantine cleanup error, no automatic retry/free/reset. Service can remain unavailable until reboot. |
+-| T-06 | Medium: memory/capacity exhaustion | Repeated opens, resources, failed host creation or retained exports/maps | 1024 render handles/open, 256 FBs/primary, 2048 retirement slots, 64 MiB/256 MiB coherent budgets. Global dumb/blob retention is outside those render limits. |
++| T-06 | Medium: memory/capacity exhaustion | Repeated opens, resources, failed host creation or retained exports/maps | 4096 render handles/open, 256 FBs/primary, 16384 retirement slots, 64 MiB/512 MiB coherent budgets. Global dumb/blob retention is outside those render limits. |
+ | T-07 | Medium: owner-event disclosure or wrong completion | Read races master transfer, failed present emits event | Owner check/dequeue under primary gate; clear on owner release; publish only after fenced success. Fence completion is not vblank timing. |
+ | T-08 | High: host renderer attack | Malformed but bounded VirGL command stream | Kernel pins authorized resources and bounds submissions; virglrenderer parses the opaque protocol. No external-renderer sandbox-hardening claim. |
+ | T-09 | High: stale CPU texture data advertised as coherent | Mapping or SYNC on exported fd | Explicit EOPNOTSUPP until a real CPU-access protocol exists; no successful no-op synchronization. |
+diff --git a/io/drmdevice/src/gem_handle.rs b/io/drmdevice/src/gem_handle.rs
+index bd44f720b..ba2a81394 100644
+--- a/io/drmdevice/src/gem_handle.rs
++++ b/io/drmdevice/src/gem_handle.rs
+@@ -15,7 +15,7 @@ use kvfs::{VfsError, VfsResult};
+ #[cfg(unittest)]
+ mod tests;
+ 
+-/// Render tables use this bit as a tag, leaving 21 generation and 10 slot bits.
++/// Render tables use this bit as a tag, leaving 19 generation and 12 slot bits.
+ pub(crate) const RENDER_HANDLE_BIT: u32 = 1 << 31;
+ 
+ /// Non-reusing allocator for Card0's shared dumb-buffer handle namespace.
+diff --git a/io/drmdevice/src/render/handles.rs b/io/drmdevice/src/render/handles.rs
+index b3b963b15..40f04a857 100644
+--- a/io/drmdevice/src/render/handles.rs
++++ b/io/drmdevice/src/render/handles.rs
+@@ -14,7 +14,9 @@ use crate::gem_handle::RENDER_HANDLE_BIT;
+ #[cfg(unittest)]
+ mod tests;
+ 
+-const INDEX_BITS: u32 = 10;
++// Match the portable service's 4096-resource ceiling for a single client.
++// The remaining 19 generation bits still retire on exhaustion, never wrap.
++const INDEX_BITS: u32 = 12;
+ const CAPACITY: usize = 1 << INDEX_BITS;
+ const GENERATION_LIMIT: u32 = (RENDER_HANDLE_BIT - 1) >> INDEX_BITS;
+ 
+diff --git a/io/drmdevice/src/render/handles/tests.rs b/io/drmdevice/src/render/handles/tests.rs
+index e5f6764d4..2f57d3b7b 100644
+--- a/io/drmdevice/src/render/handles/tests.rs
++++ b/io/drmdevice/src/render/handles/tests.rs
+@@ -68,7 +68,7 @@ fn handles_independent_tables_resolve_same_number_to_own_object() {
+     let b = object(&second, &counters, 22);
+     let ah = first.reserve().unwrap().publish(a.clone(), 0x1000);
+     let bh = second.reserve().unwrap().publish(b.clone(), 0x2000);
+-    assert_eq!(ah, 0x8000_0400);
++    assert_eq!(ah, 0x8000_1000);
+     // Linux handles are local to an open description: equal numbers across
+     // independent tables are expected, and must select different owners.
+     assert_eq!(ah, bh);
+@@ -248,7 +248,7 @@ fn handles_highest_number_is_valid_and_its_slot_never_wraps() {
+     drop(table.remove(handle).unwrap());
+     table.state.lock().cursor = CAPACITY - 1;
+     let next = table.reserve().unwrap();
+-    assert_eq!(next.handle, 0x8000_0400);
++    assert_eq!(next.handle, 0x8000_1000);
+     assert!(table.get(handle).is_err());
+     assert_eq!(
+         table.state.lock().slots[CAPACITY - 1].generation,
+@@ -266,6 +266,30 @@ fn handles_generation_exhaustion_never_returns_a_low_half_number() {
+     assert!(matches!(table.reserve(), Err(VfsError::NoMemory)));
+ }
+ 
++#[def_test(serial)]
++fn handles_large_scene_keeps_slots_above_old_limit_distinct() {
++    let table = Arc::new(Table::new().unwrap());
++    let counters = Arc::new(Counters::default());
++    let handles: Vec<_> = (0..1536)
++        .map(|id| {
++            table
++                .reserve()
++                .unwrap()
++                .publish(object(&table, &counters, id), (id as u64 + 1) * 0x1000)
++        })
++        .collect();
++    for (id, handle) in handles.iter().copied().enumerate() {
++        assert_eq!(table.get(handle).unwrap().id, id);
++        assert_eq!(table.get_mapping((id as u64 + 1) * 0x1000).unwrap().id, id);
++    }
++    for handle in handles {
++        drop(table.remove(handle).unwrap());
++        assert!(table.get(handle).is_err());
++    }
++    assert_eq!(counters.drops.load(Ordering::Acquire), 1536);
++    assert_eq!(counters.drops_outside_lock.load(Ordering::Acquire), 1536);
++}
++
+ #[def_test(serial)]
+ fn handles_full_capacity_fails_before_payload_and_recovers_empty_slot() {
+     let table = Arc::new(Table::new().unwrap());
+diff --git a/io/drmdevice/src/render/memory.rs b/io/drmdevice/src/render/memory.rs
+index d550da9c5..7aef60bf1 100644
+--- a/io/drmdevice/src/render/memory.rs
++++ b/io/drmdevice/src/render/memory.rs
+@@ -21,7 +21,9 @@ use crate::retirement::RetireOnDrop;
+ 
+ // Include queued and quarantined allocations in this budget, not only handles.
+ pub(super) const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+-const MAX_DEVICE_BACKING_BYTES: usize = 256 * 1024 * 1024;
++// Desktop games exceed the former 256-MiB cap. Keep a hard ceiling, including
++// pending and quarantined backing, rather than bypassing allocation accounting.
++const MAX_DEVICE_BACKING_BYTES: usize = 512 * 1024 * 1024;
+ static BACKING_BYTES: AtomicUsize = AtomicUsize::new(0);
+ static ALLOCATION_FAILED: AtomicBool = AtomicBool::new(false);
+ 
+diff --git a/io/drmdevice/src/render/ownership.rs b/io/drmdevice/src/render/ownership.rs
+index 413c387b4..7e943fe96 100644
+--- a/io/drmdevice/src/render/ownership.rs
++++ b/io/drmdevice/src/render/ownership.rs
+@@ -27,7 +27,10 @@ use crate::{
+     retirement::{RetireOnDrop, RetirementJob, RetirementOutcome, RetirementQueue},
+ };
+ 
+-pub(super) const RETIREMENT_CAPACITY: usize = 2048;
++// Up to 4096 resources each retain a GPU job and backing job; imports, contexts
++// and KMS files need additional permits. Fixed storage is allocated on the heap
++// once. Capacity exhaustion still rejects creation before DMA or host access.
++pub(super) const RETIREMENT_CAPACITY: usize = 16384;
+ pub(super) type RenderQueue = RetirementQueue<RenderJob, RETIREMENT_CAPACITY>;
+ 
+ static_lock! {
+diff --git a/mm/alloc-engine/docs/design.md b/mm/alloc-engine/docs/design.md
+index 778125400..d035d517b 100644
+--- a/mm/alloc-engine/docs/design.md
++++ b/mm/alloc-engine/docs/design.md
+@@ -42,6 +42,18 @@ kalloc / SlabHeap（拥有 backing 和串行化责任）
+ 
+ ## 自举、容量与统计
+ 
++### 带地址上限的分配
++
++`allocate_pages_below(count, align, end_exclusive)` 查找完整位于上限之下的伙伴块，
++校验包含二次幂取整后的容量。完全位于上限以下的 region 沿用普通分配；完全
++位于上方的跳过；跨界 region 扫描各阶空闲链表中的对齐候选，只摘除选中的块。
++跨界的大块可分裂出合法低地址子块。失败时链表、位图和计数不变，不临时占用
++高地址页，也不反复分配、释放同一高地址块。
++
++跨界 region 的最坏搜索成本与空闲节点数相关；普通分配快速路径不变。
++`BuddyPageAllocator` 暴露同名方法；`kalloc` 把物理 DMA32 上限转换到线性映射
++地址，算法层不依赖设备和内核地址转换。
++
+ 不超过 256 页的 region 使用结构内联位图，不消耗源页。
+ 较大的 region 从自身尾部保留位图页，先零化位图，再发布可用前缀中的空闲块。
+ 初始化不调用其他 allocator，也不需要堆、当前线程或调度器。
+diff --git a/mm/alloc-engine/docs/security.md b/mm/alloc-engine/docs/security.md
+index d9cae6a49..9871c44fc 100644
+--- a/mm/alloc-engine/docs/security.md
++++ b/mm/alloc-engine/docs/security.md
+@@ -49,6 +49,11 @@ allocator 无法仅凭整数地址证明页表权限或实际物理内存所有
+ 
+ ## 线程安全与执行上下文
+ 
++有上限的分配使用独占可变借用，在状态修改前校验 count、alignment 和完整
++取整范围的 checked end。只遍历已初始化的空闲节点，再通过原有 membership
++校验摘链；不读取已分配页。上限与 region 地址必须属于同一地址空间，物理地址
++转换由调用方负责。跨界链扫描仍持有上层 allocator 锁，不承诺恒定最坏耗时。
++
+ 公开修改入口需要 `&mut self`。上层 `kalloc` 继续使用原有页 allocator 锁，
+ 本改动不在内部加锁，也不在持锁路径调用其他 allocator 或可睡眠操作。
+ `RawList` 的原子插入标志只是链表实现的一部分，不允许多个 CPU 绕开上层锁
+diff --git a/mm/alloc-engine/src/buddy_alloc.rs b/mm/alloc-engine/src/buddy_alloc.rs
+index 37ae4e1bf..2d9b31ebd 100644
+--- a/mm/alloc-engine/src/buddy_alloc.rs
++++ b/mm/alloc-engine/src/buddy_alloc.rs
+@@ -457,6 +457,72 @@ impl<const PAGE_SIZE: usize> BuddyAllocator<PAGE_SIZE> {
+         Err(AllocError::NoMemory)
+     }
+ 
++    /// Allocate a rounded contiguous chunk wholly below an exclusive address limit.
++    ///
++    /// The limit is in the same address space as registered regions. Both the
++    /// requested pages and buddy rounding must fit. Ineligible free chunks stay
++    /// available to other allocations; a limit inside a larger free chunk may
++    /// still allow its lower subchunk to be split and returned.
++    ///
++    /// # Errors
++    ///
++    /// Uses the count/alignment validation of [`Self::allocate_pages`]. Returns
++    /// `NoMemory` when no eligible chunk exists, without consuming other pages.
++    pub fn allocate_pages_below(
++        &mut self,
++        count: usize,
++        align_pow2: usize,
++        end_exclusive: usize,
++    ) -> AllocResult<usize> {
++        let order = allocation_order(count)?;
++        let align = if align_pow2 == 0 {
++            PAGE_SIZE
++        } else {
++            align_pow2
++        };
++        if !align.is_power_of_two() || align < PAGE_SIZE {
++            return Err(AllocError::InvalidInput);
++        }
++        let bytes = order_size::<PAGE_SIZE>(order);
++        for region in self.regions[..self.region_count].iter_mut().flatten() {
++            if region.heap_start >= end_exclusive {
++                continue;
++            }
++            if region.usable_end <= end_exclusive {
++                if let Some(address) =
++                    Self::alloc_aligned::<PAGE_SIZE>(region, order, align / PAGE_SIZE)
++                {
++                    return Ok(address);
++                }
++                continue;
++            }
++            // Only a region crossing the limit needs a constrained scan. Do
++            // not allocate and reject a high head: doing so can repeatedly
++            // select that same head while a usable lower chunk remains free.
++            for source_order in order..=MAX_ORDER {
++                let candidate = region.free_lists[source_order]
++                    .iter()
++                    .map(|node| node as *const FreeNode as usize)
++                    .find(|address| {
++                        address.is_multiple_of(align)
++                            && address
++                                .checked_add(bytes)
++                                .is_some_and(|end| end <= end_exclusive)
++                    });
++                if let Some(address) = candidate {
++                    assert!(region.remove_free::<PAGE_SIZE>(address, source_order));
++                    return Ok(region.split_for_target::<PAGE_SIZE>(
++                        address,
++                        source_order,
++                        address,
++                        order,
++                    ));
++                }
++            }
++        }
++        Err(AllocError::NoMemory)
++    }
++
+     fn alloc_aligned<const PS: usize>(
+         region: &mut Region,
+         order: usize,
+diff --git a/mm/alloc-engine/src/buddy_alloc_tests.rs b/mm/alloc-engine/src/buddy_alloc_tests.rs
+index 49fc73a4c..04ab9eea2 100644
+--- a/mm/alloc-engine/src/buddy_alloc_tests.rs
++++ b/mm/alloc-engine/src/buddy_alloc_tests.rs
+@@ -93,6 +93,114 @@ impl Fixture {
+     }
+ }
+ 
++#[def_test]
++fn bounded_allocation_skips_high_free_head_without_consuming_it() {
++    let mut fixture = Fixture::new(32, 32);
++    let base = fixture.backing.base();
++    for page in 0..32 {
++        fixture
++            .allocator
++            .allocate_pages_at(base + page * PAGE, 1, PAGE)
++            .unwrap();
++    }
++    fixture.allocator.deallocate_pages(base, 1);
++    fixture.allocator.deallocate_pages(base + 16 * PAGE, 1);
++    assert_eq!(
++        fixture
++            .allocator
++            .allocate_pages_below(1, PAGE, base + 8 * PAGE),
++        Ok(base)
++    );
++    assert_eq!(fixture.allocator.available_pages(), 1);
++    assert_eq!(
++        fixture.allocator.allocate_pages(1, PAGE),
++        Ok(base + 16 * PAGE)
++    );
++    for page in 0..32 {
++        fixture.allocator.deallocate_pages(base + page * PAGE, 1);
++    }
++    assert_eq!(fixture.allocator.available_pages(), 32);
++}
++
++#[def_test]
++fn bounded_allocation_splits_crossing_parent_and_checks_rounded_extent() {
++    let mut fixture = Fixture::new(32, 32);
++    let base = fixture.backing.base();
++    assert_eq!(
++        fixture
++            .allocator
++            .allocate_pages_below(3, PAGE, base + 3 * PAGE),
++        Err(AllocError::NoMemory)
++    );
++    assert_eq!(fixture.allocator.available_pages(), 32);
++    let address = fixture
++        .allocator
++        .allocate_pages_below(3, PAGE, base + 4 * PAGE)
++        .unwrap();
++    assert_eq!(address, base);
++    assert_eq!(fixture.allocator.available_pages(), 28);
++    fixture.allocator.deallocate_pages(address, 3);
++    assert_eq!(fixture.allocator.allocate_pages(32, PAGE), Ok(base));
++    fixture.allocator.deallocate_pages(base, 32);
++}
++
++#[def_test]
++fn bounded_allocation_preserves_high_pages_when_low_range_is_exhausted() {
++    let mut fixture = Fixture::new(32, 32);
++    let base = fixture.backing.base();
++    let low = fixture
++        .allocator
++        .allocate_pages_below(16, PAGE, base + 16 * PAGE)
++        .unwrap();
++    assert_eq!(
++        fixture
++            .allocator
++            .allocate_pages_below(1, PAGE, base + 16 * PAGE),
++        Err(AllocError::NoMemory)
++    );
++    assert_eq!(fixture.allocator.available_pages(), 16);
++    let high = fixture.allocator.allocate_pages(16, PAGE).unwrap();
++    assert_eq!(high, base + 16 * PAGE);
++    fixture.allocator.deallocate_pages(low, 16);
++    fixture.allocator.deallocate_pages(high, 16);
++}
++
++#[def_test]
++fn bounded_allocation_searches_later_low_region() {
++    let backing = AlignedRegion::new(32, 32);
++    let base = backing.base();
++    let mut allocator = BuddyAllocator::<PAGE>::new();
++    allocator.init_region(base + 16 * PAGE, 16 * PAGE).unwrap();
++    allocator.add_region(base, 16 * PAGE).unwrap();
++    assert_eq!(
++        allocator.allocate_pages_below(3, PAGE, base + 16 * PAGE),
++        Ok(base)
++    );
++    allocator.deallocate_pages(base, 3);
++    assert_eq!(allocator.available_pages(), 32);
++}
++
++#[def_test]
++fn bounded_allocation_respects_large_alignment_and_nonpage_limit() {
++    let mut fixture = Fixture::new(32, 32);
++    let base = fixture.backing.base();
++    fixture.allocator.allocate_pages_at(base, 1, PAGE).unwrap();
++    assert_eq!(
++        fixture
++            .allocator
++            .allocate_pages_below(1, 16 * PAGE, base + 17 * PAGE - 1),
++        Err(AllocError::NoMemory)
++    );
++    let address = fixture
++        .allocator
++        .allocate_pages_below(1, 16 * PAGE, base + 17 * PAGE)
++        .unwrap();
++    assert_eq!(address, base + 16 * PAGE);
++    fixture.allocator.deallocate_pages(address, 1);
++    fixture.allocator.deallocate_pages(base, 1);
++    assert_eq!(fixture.allocator.available_pages(), 32);
++}
++
+ #[def_test]
+ fn allocated_payload_cannot_create_a_free_buddy() {
+     let mut fixture = Fixture::new(4, 4);
+diff --git a/mm/alloc-engine/src/buddy_page.rs b/mm/alloc-engine/src/buddy_page.rs
+index d0752800a..fe716d882 100644
+--- a/mm/alloc-engine/src/buddy_page.rs
++++ b/mm/alloc-engine/src/buddy_page.rs
+@@ -18,6 +18,19 @@ impl<const PAGE_SIZE: usize> BuddyPageAllocator<PAGE_SIZE> {
+             inner: BuddyAllocator::new(),
+         }
+     }
++
++    /// Allocates a rounded chunk wholly below an exclusive virtual-address limit.
++    ///
++    /// See [`BuddyAllocator::allocate_pages_below`] for rounding and errors.
++    pub fn allocate_pages_below(
++        &mut self,
++        num_pages: usize,
++        align_pow2: usize,
++        end_exclusive: usize,
++    ) -> AllocResult<usize> {
++        self.inner
++            .allocate_pages_below(num_pages, align_pow2, end_exclusive)
++    }
+ }
+ 
+ impl<const PAGE_SIZE: usize> BaseAllocator for BuddyPageAllocator<PAGE_SIZE> {
+diff --git a/mm/kaddr_layout/src/aarch64.rs b/mm/kaddr_layout/src/aarch64.rs
+index 451aff0b4..5f868f197 100644
+--- a/mm/kaddr_layout/src/aarch64.rs
++++ b/mm/kaddr_layout/src/aarch64.rs
+@@ -32,7 +32,7 @@ pub const LAYOUT: LayoutConsts = LayoutConsts {
+ //   0x0000_0000_6000_1000 ┄┄┘ ← SIGNAL_TRAMPOLINE
+ //                            ·
+ //   0x0000_7FFF_0000_0000 ┄┐ ← USER_STACK_TOP
+-//          ↑ 0x8_0000       │   USER_STACK_SIZE = 512 KiB
++//          ↑ 0x80_0000      │   USER_STACK_SIZE = 8 MiB
+ //   0x0000_7FFF_FFFF_F000 ┄┄┘ ← USER_SPACE_BASE + USER_SPACE_SIZE
+ 
+ pub const USER_LAYOUT: UserLayoutConsts = UserLayoutConsts {
+@@ -44,5 +44,7 @@ pub const USER_LAYOUT: UserLayoutConsts = UserLayoutConsts {
+     user_heap_size_max: 0x2000_0000,
+     signal_trampoline: 0x6000_1000,
+     user_stack_top: 0x7fff_0000_0000,
+-    user_stack_size: 0x8_0000,
++    // Desktop applications can exceed the old 512-KiB main stack. This is a
++    // virtual reservation; anonymous faults allocate only the pages touched.
++    user_stack_size: 0x80_0000,
+ };
+diff --git a/mm/kalloc/docs/design.md b/mm/kalloc/docs/design.md
+index 6c359b6e3..272512aec 100644
+--- a/mm/kalloc/docs/design.md
++++ b/mm/kalloc/docs/design.md
+@@ -234,12 +234,13 @@ free 到 per-CPU cache 的对象。
+ 
+ ### DMA32 与定址页
+ 
+-`alloc_dma_pages()` 绕过 PCP，先从全局 buddy 取得连续页，再通过 `v2p` 检查整个物理
+-区间是否低于 4 GiB。区间不满足限制时立即归还并返回 `NoMemory`。该接口只负责内存
+-位置；页属性切换、平台 share/unshare 和设备生命周期由 `kdma` 等上层完成。
++`alloc_dma_pages()` 绕过 PCP，把物理 4 GiB 排他上限转换到线性映射地址，并调用
++buddy 的 `allocate_pages_below()`，直接搜索满足范围与对齐的连续块。取整后的
++整个伙伴块必须落在上限内。保留 `v2p` 与 checked end 的防御检查，异常时归还。
++上限外的空闲块不被临时取走，低地址没有合适块时才返回 `NoMemory`。
+ 
+-当前 page allocator 没有独立 DMA32 zone，因此它采用“先分配、后检查”，不能保证在
+-存在低端空闲页时一定找到它们。
++它仍没有独立 DMA32 zone，不保证低地址内存不被普通用途消耗，也不实现压缩或
++页迁移。该接口只负责位置；页属性、平台 share/unshare 和生命周期由上层完成。
+ 
+ ### `GlobalPage`
+ 
+diff --git a/mm/kalloc/docs/security.md b/mm/kalloc/docs/security.md
+index 4f0d872bd..3db9f31bc 100644
+--- a/mm/kalloc/docs/security.md
++++ b/mm/kalloc/docs/security.md
+@@ -53,7 +53,7 @@ boot memory map / kernel callers / C components / DMA users
+ |------|------|----------|----------|
+ | 启动内存 | `kruntime` 从 firmware/boot memory 描述中筛选的 free region，经 `p2v` 传入 | 底层 buddy 拒绝未页对齐、过小、超出 region 数上限或与既有 region 重叠的输入；首个 region 建立 page/byte allocator | 无法验证地址是否真实映射、可写、属于 free RAM 或与 allocator 外部 owner 冲突；端点算术仍依赖可信范围 |
+ | Rust 内核 caller | `Layout`、raw allocation pointer、页数、alignment、固定地址、`UsageKind` | allocation 返回 `Result`；部分大小计算和汇总 usage subtraction 使用 checked arithmetic | safe 外观的部分 deallocation API 仍依赖 caller contract，错误参数可能导致 UB |
+-| DMA / 设备 | 连续页数量、alignment、虚实地址转换结果 | allocation 后检查整个物理区间低于 4 GiB，不满足则归还 | 没有 DMA32 zone；错误 `v2p`、区间溢出或设备越权仍可导致错误 DMA |
++| DMA / 设备 | 连续页数量、alignment、虚实地址转换结果 | 按 DMA32 地址上限搜索，取整块完整受限；保留 checked 物理端点检查 | 没有独立 DMA32 保留区；地址转换和设备授权仍由内核合同保证 |
+ | TEE/DICE C ABI | C pointer、signed length、allocation/free 配对 | null、部分长度和 `Layout` 构造检查；symbols 标为 unsafe | 无法验证 raw region 真实长度、重叠和 provenance，恶意或损坏的 C caller 可造成任意内存破坏 |
+ | Tracking/观测 | enable/disable、generation range、visitor | feature-gated、全局锁和递归 guard | backtrace/地址可能泄露内核布局；visitor 重入 tracking API 可能死锁或 panic |
+ 
+@@ -204,7 +204,7 @@ allocator 初始化由 boot CPU 串行完成。ready atomics 用于发布已完
+ | T-03 | slab intrusive link 被越界写、重复插入或并发修改 | 高 | stale alias、错误 size class、double free、NMI 重入 | canonical layout、compile-time link-size check、local IRQ guard 和中央锁保护正常路径；NMI 和伪造 pointer 明确不支持 |
+ | T-04 | PCP 保存错误页地址或页数，随后重复分配/错误合并 | 高 | caller 用错误 `num_pages` free，或 CPU-local 并发约束被破坏 | 固定的 1–4 页 cache 类型和 `split_to_chunks` 保持内部 bookkeeping；输入 provenance 仍由 caller 保证 |
+ | T-05 | C ABI raw pointer/length 导致越界读写或 header 破坏 | 高 | TEE/DICE C caller 传入无效、负值转换后的长度、重叠 memcpy 或错误 free pointer | unsafe ABI contract、null/部分 bounds 检查和配对 header；无法验证真实对象边界，接口只允许受信任组件调用 |
+-| T-06 | DMA 地址超出设备可寻址范围或指向错误物理页 | 高 | `v2p` 错误、地址区间算术异常、caller/device 生命周期错误 | `alloc_dma_pages()` 检查结束地址低于 4 GiB 并在失败时归还；上层 `kdma` 管理页属性和平台 share/release，仍依赖正确设备授权 |
++| T-06 | DMA 地址超出设备可寻址范围或指向错误物理页 | 高 | `v2p` 错误、地址区间算术异常、caller/device 生命周期错误 | `alloc_dma_pages()` 按 4 GiB 排他上限选块，并用 checked end 防御复核；上层 `kdma` 管理页属性和平台 share/release，仍依赖正确设备授权 |
+ | T-07 | 锁递归、锁顺序反转或 NMI 打断导致永久自旋 | 中 | allocator 在 NMI 中使用，新增路径形成 `palloc -> balloc`，或 tracking visitor 再锁 tracking state | `SpinNoIrq` 排除普通 IRQ、文档固定锁序、tracker 有 allocation recursion guard；NMI 与 tracking callback 重入仍是剩余限制 |
+ | T-08 | per-CPU cache 隐藏可复用内存，促使中央 allocator 提前扩容或 OOM | 中 | CPU/class 工作集不均衡、内存压力、CPU 停止运行 | PCP 固定 entry 容量；slab cache 使用最多 32 对象的 batch 和不足两个 batch 的高水位；没有全 CPU reclaim，风险只做到有界而未消除 |
+ | T-09 | 大小、页数、usage 或地址算术溢出 | 中 | 极端 caller 输入、错误 region 或 accounting 不配对 | `pages_to_bytes`、per-CPU 累计量和 usage 汇总 subtraction 使用 checked arithmetic，`Layout` 验证部分输入；部分地址端点计算仍依赖可信内核范围 |
+@@ -220,7 +220,7 @@ allocator 初始化由 boot CPU 串行完成。ready atomics 用于发布已完
+ | F-02 | byte heap 或 page buddy 无法满足请求 | 内存耗尽、碎片化或 cache residency | 显式 API 返回 `AllocError` | Rust `GlobalAlloc` 路径记录 OOM 后进入 `handle_alloc_error`，通常终止当前内核运行 | 2 | byte heap 减小扩容请求重试；PCP/slab 允许 partial refill；显式 API 向上返回错误 |
+ | F-03 | PCP batch 大块申请失败 | buddy 碎片化 | 无法一次取得目标 batch | 性能下降，不一定 allocation 失败 | 4 | 自动退化为逐 block refill，只有一个 block 都拿不到才返回错误 |
+ | F-04 | slab refill 中央 allocator 中途耗尽 | byte heap 压力或碎片化 | partial cache | 当前 allocation 优先从 partial refill 返回；完全失败时扩展 byte heap | 3 | 保留已取得对象，不回滚；外层执行 heap growth 后重试 |
+-| F-05 | DMA allocation 落在 4 GiB 以上 | buddy 没有低端定向策略 | 本次 DMA allocation 被拒绝 | 设备初始化或 I/O 失败，即使低端内存可能仍存在 | 3 | 立即归还不合格页并返回 `NoMemory`；后续可引入 DMA32 zone |
++| F-05 | 无合适的低地址连续块 | 低地址页被消耗或碎片化 | DMA allocation 返回 NoMemory | 设备初始化或 I/O 失败 | 3 | 定向搜索全部合适 region；不消耗高地址块；未实现低端保留区或压缩 |
+ | F-06 | usage overflow/underflow | lifetime 累计量溢出、wrong-kind/free 配对或计数异常 | 热路径累计溢出或汇总下溢时 panic | 可能导致内核停止 | 2 | checked arithmetic fail-fast；usage 不参与 allocator metadata mutation |
+ | F-07 | cache full 触发 batch drain | 正常突发 free | 最多 32 次中央 deallocation 持有锁并保持 IRQ-off | IRQ latency 或跨 CPU allocation latency 尖峰 | 3 | 对象数和水位提供明确上界；仍需 workload 实测和调参 |
+ | F-08 | 持锁 CPU 停滞 | panic、NMI、硬件问题或错误重入 | 其他 CPU 在中央 allocator 锁上自旋 | 系统级 allocation hang | 1 | 临界区不睡眠；普通 IRQ 被关闭；NMI allocation 禁止，新增路径必须遵守锁序 |
+@@ -267,8 +267,8 @@ allocator 初始化由 boot CPU 串行完成。ready atomics 用于发布已完
+    nonblocking/reclaim flags；slow path 可能持中央锁、批量循环并扩展 heap。
+ 5. **无 NUMA、memory cgroup 或 pressure-aware 水位**：所有中央内存共用一个 page buddy
+    和一个 byte allocator。
+-6. **DMA32 采用 allocation 后检查**：没有低端 zone 或定向搜索，可能出现可用低端页
+-   尚存但请求仍失败的情况。
++6. **DMA32 没有独立保留区**：已支持定向搜索，但普通用途仍可消耗低端页。
++   没有合适低地址连续块时仍返回失败；不实现内存压缩或页迁移。
+ 7. **deallocation provenance 不做 production 验证**：错误 pointer、layout、页数、
+    `UsageKind` 或 double free 主要依赖 caller contract；部分公开 safe 方法的约束无法由
+    类型系统强制。
+diff --git a/mm/kalloc/src/lib.rs b/mm/kalloc/src/lib.rs
+index b3c4782ab..1d3b0a1dd 100644
+--- a/mm/kalloc/src/lib.rs
++++ b/mm/kalloc/src/lib.rs
+@@ -578,8 +578,9 @@ impl GlobalAllocator {
+     /// Allocates contiguous DMA pages.
+     ///
+     /// DMA allocations must come from physical memory below 4 GiB.
+-    /// The page allocator only knows virtual addresses, so the
+-    /// DMA32 filtering happens here using `v2p` translation.
++    /// The page allocator searches below the linear-map equivalent of the
++    /// DMA32 limit. It must not reject one arbitrary high allocation while
++    /// leaving suitable low-address pages unsearched.
+     pub fn alloc_dma_pages(
+         &self,
+         num_pages: usize,
+@@ -592,11 +593,15 @@ impl GlobalAllocator {
+         );
+         const DMA32_LIMIT: usize = 0x1_0000_0000;
+ 
+-        let addr = self.palloc.lock().allocate_pages(num_pages, align_pow2)?;
++        let addr = self.palloc.lock().allocate_pages_below(
++            num_pages,
++            align_pow2,
++            kaddr_layout::p2v(DMA32_LIMIT),
++        )?;
+ 
+         let phys = kernel_virt_to_phys(addr);
+         let size = pages_to_bytes(num_pages);
+-        if phys + size > DMA32_LIMIT {
++        if phys.checked_add(size).is_none_or(|end| end > DMA32_LIMIT) {
+             self.palloc.lock().deallocate_pages(addr, num_pages);
+             return Err(AllocError::NoMemory);
+         }
+diff --git a/process/kexec/docs/design.md b/process/kexec/docs/design.md
+index 7bf72d6df..f2fd65b84 100644
+--- a/process/kexec/docs/design.md
++++ b/process/kexec/docs/design.md
+@@ -73,6 +73,13 @@ The outer flow maps an anonymous stack, builds argc/argv/env/aux data with
+ `app_stack_region`, checks its configured stack capacity, populates/writes pages,
+ and maps an anonymous heap. The returned tuple is entry address and user SP.
+ 
++The AArch64 layout reserves an 8-MiB main stack. Only argument pages are
++populated at exec; other stack pages use ordinary anonymous demand faults.
++The fixed reservation also supplies the initial soft/hard `RLIMIT_STACK`
++values through the process runtime. This replaces the 512-KiB AArch64
++capacity that faults on larger desktop application frames. It does not add
++grow-down VMAs or make later rlimit changes resize an existing stack.
++
+ ## Commit boundary and error handling
+ 
+ Preparation failures leave the previous image intact. `MmSpace::clear` is the
+diff --git a/process/kexec/docs/security.md b/process/kexec/docs/security.md
+index 879a2fb88..f11a77dc0 100644
+--- a/process/kexec/docs/security.md
++++ b/process/kexec/docs/security.md
+@@ -78,6 +78,11 @@ not explicitly erase them. The crate does not intentionally log their contents.
+ 
+ ## Known limitations and audit checklist
+ 
++AArch64's 8-MiB stack capacity is a virtual reservation, not an eager physical
++allocation. Writes outside that reservation remain unmapped. It increases the
++maximum demand-backed stack footprint per process; it does not add stack
++growth, a dedicated guard VMA, or runtime enforcement of a reduced rlimit.
++
+ - Preserve current-fs initialization and a consistent credential snapshot.
+ - Keep file-private mappings on the approved MM APIs and align both offsets.
+ - Never imply an arbitrary load error leaves the previous address space intact.

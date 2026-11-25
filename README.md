@@ -1,6 +1,6 @@
 # x-kernel Chromium 运行存档
 
-在 Linux 宿主的 AArch64 QEMU 客体中启动 x-kernel、Weston 和 Chromium。这里保存个人复现所用的冻结内核、对应源码补丁和根文件系统。功能版用于打开三个本地页面，性能版是另一个内核快照。
+在 Linux 宿主的 AArch64 QEMU 客体中启动 x-kernel、Weston 和 Chromium。本仓库保存三个可运行的内核快照。功能版打开三个本地测试页，性能版保留优化后的内核，VirGL 版演示 Chromium WebGL1 硬件渲染。
 
 ## 克隆和启动
 
@@ -35,9 +35,33 @@ chromium --ozone-platform=wayland --no-sandbox \
 | --- | --- |
 | 校验资源和查看启动参数 | `python3 run.py --check` |
 | 启动性能快照 | `python3 run.py performance` |
+| 启动 VirGL 3D 演示 | `python3 run.py virgl` |
 | 离线使用已下载的 Release 镜像 | `python3 run.py --archive /path/to/rootfs.img.xz` |
 | 新建独立的工作磁盘 | `python3 run.py --workdir /path/to/fresh-workdir` |
 | 在可用的 AArch64 KVM 宿主上尝试启动 | `python3 run.py --accel kvm` |
+
+## VirGL 3D 演示
+
+宿主需要支持 OpenGL 的 QEMU 和显卡驱动。在 Ubuntu 24.04 上，安装 3D 依赖后即可启动。
+
+```bash
+sudo apt install e2fsprogs qemu-system-modules-opengl libvirglrenderer1
+python3 run.py virgl
+```
+
+3D 版使用 4 vCPU、4 GiB 内存、`virtio-gpu-gl-pci` 和 GTK OpenGL 窗口。它复用 Release 中的根文件系统，首次运行将演示工具写入单独的 3D 工作磁盘。给每个已启动的模式至少预留 2.25 GiB 磁盘空间。宿主可先用 `qemu-system-aarch64 -device help` 查看是否提供 `virtio-gpu-gl-pci`。
+
+出现 `kylin-x` 提示符后，在客体串口运行以下命令。
+
+```sh
+virgl-dev start
+virgl-dev webgl
+virgl-dev status
+```
+
+`start` 启动 Weston GL。`webgl` 在 Chromium 打开本地着色器测试页，渲染结果出来后，`status` 会给出渲染器和 `page_verdict`。预期渲染器包含 `virgl`，`readback_passed` 为 `true`，表示 WebGL1 画面通过像素读回核验。结束时执行 `virgl-dev stop`、`sync`，再按 **Ctrl+A**、**X** 退出 QEMU。
+
+图形链路为 Chromium → ANGLE/Mesa → x-kernel DRM → VirtIO GPU → QEMU VirGL → 宿主显卡。CPU 默认使用 TCG。ARM64 Linux 宿主有可用的 `/dev/kvm` 时，可以通过 `python3 run.py virgl --accel kvm` 尝试启用 CPU 硬件虚拟化。
 
 ## 源码快照
 
@@ -60,5 +84,7 @@ archive="$(pwd)"
 ```
 
 性能版以 `799107c7d5b5db18276132af48ad76cc0fc3c30f` 为基点，解包 `source/x-kernel-performance-base.tar.gz` 后应用 `source/performance.patch`。两版冻结构建信息在 `source/*.toml`。首个可运行版本的 Git 标签及历史在 `source/first-runnable.bundle`，对应内核在 `kernels/first-runnable.bin`。
+
+VirGL 版使用同一份 `source/x-kernel-functional-base.tar.gz`。解包后仅应用 `source/virgl.patch`，使用 `source/aarch64-virgl.config` 替换上例的配置，再执行 `make defconfig` 和 `make build`。冻结内核对应 `fa00ae75d8c05e86127e5475a05159123262ebbe` 加该补丁。
 
 x-kernel 源码保留[上游许可证](LICENSE)和[版权声明](NOTICE)。根文件系统基于提供的 Alpine AArch64 镜像，包含 Chromium、Weston、seatd 和测试页。存档镜像清理了账户历史、浏览器配置与运行日志，并锁定镜像里的密码登录。镜像和内核身份见 [rootfs.json](rootfs.json) 和 [SHA256SUMS](SHA256SUMS)。

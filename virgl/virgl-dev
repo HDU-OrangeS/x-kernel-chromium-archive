@@ -1,0 +1,2 @@
+#!/bin/sh
+exec python3 /usr/local/libexec/xkernel-virgl/virgl-dev.py "$@"
